@@ -1,0 +1,10 @@
+{
+  "name": "pepcalc",
+  "private": true,
+  "scripts": {
+    "docs:list": "tsx scripts/docs-list.ts"
+  },
+  "devDependencies": {
+    "tsx": "^4.21.0"
+  }
+}
