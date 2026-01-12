@@ -1,0 +1,634 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import re
+import sys
+from pathlib import Path
+from typing import Optional, Tuple
+
+
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "pepcalc"
+CONFIG_PATH = CONFIG_DIR / "peptides.json"
+DEFAULT_VIAL_SIZE_ML = 3.0
+
+
+class UserExit(Exception):
+    pass
+
+
+def normalize_name(name: str) -> str:
+    return name.strip().lower()
+
+
+def fmt_num(value: float, max_dec: int = 2) -> str:
+    text = f"{value:.{max_dec}f}".rstrip("0").rstrip(".")
+    return text if text else "0"
+
+
+def get_vial_size_ml(entry: Optional[dict]) -> float:
+    if not entry:
+        return DEFAULT_VIAL_SIZE_ML
+    value = entry.get("vial_size_ml")
+    return float(value) if value else DEFAULT_VIAL_SIZE_ML
+
+
+def parse_positive_float(value: str, label: str) -> float:
+    try:
+        num = float(value)
+    except ValueError:
+        raise ValueError(f"{label} must be a number.")
+    if num <= 0:
+        raise ValueError(f"{label} must be greater than 0.")
+    return num
+
+
+def parse_dose_input(raw: str, label: str = "dose") -> float:
+    text = raw.strip().lower().replace(" ", "")
+    match = re.fullmatch(r"([0-9]*\.?[0-9]+)([a-z]*)", text)
+    if not match:
+        raise ValueError(f"{label} must be a number with optional unit (mcg or mg).")
+    value = float(match.group(1))
+    unit = match.group(2)
+    if unit in ("", "mcg", "ug"):
+        mcg = value
+    elif unit == "mg":
+        mcg = value * 1000.0
+    else:
+        raise ValueError(f"{label} unit must be mcg or mg.")
+    if mcg <= 0:
+        raise ValueError(f"{label} must be greater than 0.")
+    return mcg
+
+
+def parse_volume_or_units_input(raw: str, label: str = "target volume") -> Tuple[float, str]:
+    text = raw.strip().lower().replace(" ", "")
+    match = re.fullmatch(r"([0-9]*\.?[0-9]+)([a-z]*)", text)
+    if not match:
+        raise ValueError(f"{label} must be a number with optional unit (mL or units).")
+    value = float(match.group(1))
+    unit = match.group(2)
+    if value <= 0:
+        raise ValueError(f"{label} must be greater than 0.")
+    if unit in ("",):
+        return value, "none"
+    if unit == "ml":
+        return value, "ml"
+    if unit in ("u", "unit", "units"):
+        return value / 100.0, "units"
+    raise ValueError(f"{label} unit must be mL or units.")
+
+
+def fmt_dose(mcg: float) -> str:
+    if mcg >= 1000:
+        return f"{fmt_num(mcg / 1000.0)}mg ({fmt_num(mcg)}mcg)"
+    return f"{fmt_num(mcg)}mcg"
+
+
+def fmt_dose_with_units(entry: dict) -> str:
+    result = calculate(entry["vial_mg"], entry["recon_ml"], entry["dose_mcg"])
+    dose_mcg = entry["dose_mcg"]
+    dose_mg = dose_mcg / 1000.0
+    if dose_mcg >= 1000:
+        primary = f"{fmt_num(dose_mg)}mg"
+        secondary = f"{fmt_num(dose_mcg)}mcg"
+    else:
+        primary = f"{fmt_num(dose_mcg)}mcg"
+        secondary = f"{fmt_num(dose_mg, 4)}mg"
+    return f"{primary} ({secondary}, {fmt_num(result['units'])}u)"
+
+
+def recommend_target_ml(
+    vial_mg: float,
+    dose_mcg: float,
+    syringe_units: float,
+    min_units: float,
+    vial_size_ml: Optional[float],
+    preferred_units: float = 10.0,
+) -> Tuple[float, float, float, Optional[float]]:
+    max_units = syringe_units
+    max_units_by_vial = None
+    if vial_size_ml is not None:
+        max_target_ml = (vial_size_ml * dose_mcg) / (vial_mg * 1000.0)
+        max_units_by_vial = max_target_ml * 100.0
+        max_units = min(max_units, max_units_by_vial)
+    recommended_units = min(max(preferred_units, min_units), max_units)
+    return recommended_units / 100.0, recommended_units, max_units, max_units_by_vial
+
+
+def gather_mix_inputs(entry: Optional[dict]) -> dict:
+    name_default = entry["name"] if entry else None
+    name = prompt_text("Peptide name", default=name_default, required=True)
+    vial_default = entry.get("vial_mg") if entry else None
+    dose_default = entry.get("dose_mcg") if entry else None
+    recon_default = entry.get("recon_ml") if entry else None
+    vial_size_default = get_vial_size_ml(entry) if entry else DEFAULT_VIAL_SIZE_ML
+
+    vial_mg = prompt_positive_float("Peptide amount (mg)", default=vial_default)
+    dose_mcg = prompt_dose_mcg("Desired dose", default=dose_default)
+
+    syringe_units = prompt_positive_float("Syringe max units (U-100)", default=100.0)
+    min_units = prompt_positive_float("Minimum practical units per dose", default=2.0)
+    vial_size_ml = prompt_positive_float("Vial size (mL)", default=vial_size_default)
+
+    rec_target_ml, rec_units, max_units, max_units_by_vial = recommend_target_ml(
+        vial_mg=vial_mg,
+        dose_mcg=dose_mcg,
+        syringe_units=syringe_units,
+        min_units=min_units,
+        vial_size_ml=vial_size_ml,
+    )
+    print(
+        f"Recommendation: {fmt_num(rec_target_ml)}mL per dose "
+        f"(~{fmt_num(rec_units)} units)."
+    )
+    if max_units < min_units:
+        print(
+            f"Note: constraints cap you at {fmt_num(max_units)} units per dose, "
+            f"below your minimum of {fmt_num(min_units)}."
+        )
+    if max_units_by_vial is not None and max_units_by_vial < syringe_units:
+        print(
+            f"Note: vial volume caps you at {fmt_num(max_units_by_vial)} units per dose."
+        )
+
+    target_default = None
+    target_default = rec_target_ml
+    if recon_default:
+        target_from_recon = (dose_mcg / (vial_mg * 1000.0)) * float(recon_default)
+        max_reasonable_ml = min(vial_size_ml, syringe_units / 100.0)
+        if 0 < target_from_recon <= max_reasonable_ml:
+            target_default = target_from_recon
+        else:
+            print(
+                f"Note: saved BAC implies {fmt_num(target_from_recon)}mL per dose; "
+                "using recommendation instead."
+            )
+    target_ml = prompt_target_volume(default_ml=target_default)
+
+    recon_ml = (vial_mg * 1000.0 * target_ml) / dose_mcg
+    units_per_dose = target_ml * 100.0
+    result = calculate(vial_mg, recon_ml, dose_mcg)
+
+    return {
+        "name": name,
+        "vial_mg": vial_mg,
+        "dose_mcg": dose_mcg,
+        "recon_ml": recon_ml,
+        "vial_size_ml": vial_size_ml,
+        "target_ml": target_ml,
+        "units_per_dose": units_per_dose,
+        "result": result,
+        "syringe_units": syringe_units,
+        "min_units": min_units,
+    }
+
+
+def print_mix_summary(data: dict) -> None:
+    print(f"{data['name']} (peptide: {fmt_num(data['vial_mg'])}mg)")
+    print(
+        "Target dose: "
+        f"{fmt_dose(data['dose_mcg'])} at {fmt_num(data['target_ml'])}mL "
+        f"({fmt_num(data['units_per_dose'])} units)"
+    )
+    print(f"BAC water to add: {fmt_num(data['recon_ml'])}mL")
+    print(f"Vial size: {fmt_num(data['vial_size_ml'])}mL")
+    result = data["result"]
+    print(
+        "Concentration: "
+        f"{fmt_num(result['concentration_mg_ml'])}mg/mL "
+        f"({fmt_num(result['concentration_mcg_ml'])}mcg/mL)"
+    )
+    if data["units_per_dose"] > data["syringe_units"]:
+        print(
+            f"Warning: dose is {fmt_num(data['units_per_dose'])} units, "
+            f"exceeds syringe capacity of {fmt_num(data['syringe_units'])} units."
+        )
+    if data["units_per_dose"] < data["min_units"]:
+        print(f"Note: doses under {fmt_num(data['min_units'])} units can be hard to measure.")
+    if data["recon_ml"] > data["vial_size_ml"]:
+        max_dose_ml = (data["dose_mcg"] / (data["vial_mg"] * 1000.0)) * data["vial_size_ml"]
+        print(
+            f"Warning: required volume {fmt_num(data['recon_ml'])}mL exceeds max vial volume "
+            f"{fmt_num(data['vial_size_ml'])}mL."
+        )
+        print(
+            f"Max vial volume yields {fmt_num(max_dose_ml)}mL per dose "
+            f"({fmt_num(max_dose_ml * 100)} units)."
+        )
+
+
+def prompt_text(label: str, default: Optional[str] = None, required: bool = False) -> str:
+    while True:
+        suffix = f" [{default}]" if default is not None else ""
+        value = input(f"{label}{suffix}: ").strip()
+        if value.lower() in ("q", "quit", "exit"):
+            raise UserExit()
+        if value:
+            return value
+        if default is not None:
+            return default
+        if not required:
+            return ""
+        print("Please enter a value.")
+
+
+def prompt_positive_float(label: str, default: Optional[float] = None) -> float:
+    while True:
+        suffix = f" [{fmt_num(default)}]" if default is not None else ""
+        raw = input(f"{label}{suffix}: ").strip()
+        if raw.lower() in ("q", "quit", "exit"):
+            raise UserExit()
+        if not raw:
+            if default is not None:
+                return float(default)
+            print("Please enter a value.")
+            continue
+        try:
+            value = float(raw)
+        except ValueError:
+            print("Please enter a number.")
+            continue
+        if value <= 0:
+            print("Value must be greater than 0.")
+            continue
+        return value
+
+
+def prompt_dose_mcg(label: str, default: Optional[float] = None) -> float:
+    suffix = f" [{fmt_dose(default)}]" if default is not None else ""
+    while True:
+        raw = input(f"{label} (mcg or mg){suffix}: ").strip()
+        if raw.lower() in ("q", "quit", "exit"):
+            raise UserExit()
+        if not raw:
+            if default is not None:
+                return float(default)
+            print("Please enter a value.")
+            continue
+        try:
+            return parse_dose_input(raw, label)
+        except ValueError as exc:
+            print(exc)
+
+
+def prompt_target_volume(default_ml: Optional[float]) -> float:
+    suffix = ""
+    if default_ml is not None:
+        suffix = f" [{fmt_num(default_ml)}mL ({fmt_num(default_ml * 100)}u)]"
+    while True:
+        raw = input(f"Target volume per dose (mL or units){suffix}: ").strip()
+        if raw.lower() in ("q", "quit", "exit"):
+            raise UserExit()
+        if not raw:
+            if default_ml is not None:
+                return float(default_ml)
+            print("Please enter a value.")
+            continue
+        try:
+            value_ml, kind = parse_volume_or_units_input(raw, "target volume")
+        except ValueError as exc:
+            print(exc)
+            continue
+        if kind == "none" and value_ml > 1:
+            value_ml = value_ml / 100.0
+        return value_ml
+
+
+def prompt_yes_no(label: str, default: bool = False) -> bool:
+    suffix = " [Y/n]" if default else " [y/N]"
+    while True:
+        raw = input(f"{label}{suffix}: ").strip().lower()
+        if raw in ("q", "quit", "exit"):
+            raise UserExit()
+        if not raw:
+            return default
+        if raw in ("y", "yes"):
+            return True
+        if raw in ("n", "no"):
+            return False
+        print("Please enter y or n.")
+
+
+def select_peptide(peptides: dict) -> Optional[dict]:
+    if not peptides:
+        return None
+    entries = sorted(peptides.values(), key=lambda item: item.get("name", "").lower())
+    print("Saved peptides:")
+    for idx, entry in enumerate(entries, start=1):
+        print(
+            f"{idx}) {entry['name']} "
+            f"(peptide: {fmt_num(entry['vial_mg'])}mg, "
+            f"BAC: {fmt_num(entry['recon_ml'])}mL, "
+            f"vial size: {fmt_num(get_vial_size_ml(entry))}mL, "
+            f"dose: {fmt_dose_with_units(entry)})"
+        )
+    print("0) New peptide")
+    while True:
+        raw = input("Select peptide [0]: ").strip()
+        if raw.lower() in ("q", "quit", "exit"):
+            raise UserExit()
+        if not raw:
+            return None
+        if raw.isdigit():
+            choice = int(raw)
+            if choice == 0:
+                return None
+            if 1 <= choice <= len(entries):
+                return entries[choice - 1]
+        match = peptides.get(normalize_name(raw))
+        if match:
+            return match
+        print("Invalid choice.")
+
+
+def load_config() -> dict:
+    if not CONFIG_PATH.exists():
+        return {"peptides": {}}
+    try:
+        data = json.loads(CONFIG_PATH.read_text())
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Config file is invalid JSON: {CONFIG_PATH}") from exc
+    if not isinstance(data, dict) or "peptides" not in data or not isinstance(data["peptides"], dict):
+        return {"peptides": {}}
+    return data
+
+
+def save_config(data: dict) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        CONFIG_PATH.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+    except PermissionError as exc:
+        raise RuntimeError(f"Unable to write config file: {CONFIG_PATH}") from exc
+
+
+def calculate(vial_mg: float, recon_ml: float, dose_mcg: float) -> dict:
+    concentration_mg_ml = vial_mg / recon_ml
+    concentration_mcg_ml = concentration_mg_ml * 1000.0
+    units = (dose_mcg / concentration_mcg_ml) * 100.0
+    return {
+        "concentration_mg_ml": concentration_mg_ml,
+        "concentration_mcg_ml": concentration_mcg_ml,
+        "units": units,
+    }
+
+
+def format_output(
+    name: str,
+    vial_mg: float,
+    recon_ml: float,
+    dose_mcg: float,
+    vial_size_ml: Optional[float] = None,
+) -> str:
+    result = calculate(vial_mg, recon_ml, dose_mcg)
+    line1 = f"{name} (peptide: {fmt_num(vial_mg)}mg, BAC: {fmt_num(recon_ml)}mL"
+    if vial_size_ml:
+        line1 += f", vial size: {fmt_num(vial_size_ml)}mL"
+    line1 += ")"
+    line2 = (
+        "Concentration: "
+        f"{fmt_num(result['concentration_mg_ml'])}mg/mL "
+        f"({fmt_num(result['concentration_mcg_ml'])}mcg/mL)"
+    )
+    line3 = f"Dose: {fmt_dose(dose_mcg)} = {fmt_num(result['units'])} units"
+    return "\n".join([line1, line2, line3])
+
+
+def handle_calc(args: argparse.Namespace) -> int:
+    try:
+        vial_mg = parse_positive_float(args.vial_mg, "peptide amount (mg)")
+        recon_ml = parse_positive_float(args.recon_ml, "BAC volume (mL)")
+        dose_mcg = parse_dose_input(args.dose_mcg, "dose")
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    print(format_output(args.peptide, vial_mg, recon_ml, dose_mcg))
+    return 0
+
+
+def handle_save(args: argparse.Namespace) -> int:
+    try:
+        vial_mg = parse_positive_float(args.vial_mg, "peptide amount (mg)")
+        recon_ml = parse_positive_float(args.recon_ml, "BAC volume (mL)")
+        dose_mcg = parse_dose_input(args.dose_mcg, "dose")
+        vial_size_ml = (
+            parse_positive_float(args.vial_size_ml, "vial size (mL)")
+            if args.vial_size_ml
+            else DEFAULT_VIAL_SIZE_ML
+        )
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    try:
+        data = load_config()
+    except RuntimeError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    data["peptides"][normalize_name(args.peptide)] = {
+        "name": args.peptide,
+        "vial_mg": vial_mg,
+        "recon_ml": recon_ml,
+        "vial_size_ml": vial_size_ml,
+        "dose_mcg": dose_mcg,
+    }
+    try:
+        save_config(data)
+    except RuntimeError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    print(f"Saved {args.peptide}.")
+    return 0
+
+
+def handle_list(_: argparse.Namespace) -> int:
+    try:
+        data = load_config()
+    except RuntimeError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    peptides = data.get("peptides", {})
+    if not peptides:
+        print("No saved peptides.")
+        return 0
+    for entry in sorted(peptides.values(), key=lambda item: item.get("name", "").lower()):
+        print(
+            f"{entry['name']} "
+            f"(peptide: {fmt_num(entry['vial_mg'])}mg, "
+            f"BAC: {fmt_num(entry['recon_ml'])}mL, "
+            f"vial size: {fmt_num(get_vial_size_ml(entry))}mL, "
+            f"dose: {fmt_dose_with_units(entry)})"
+        )
+    return 0
+
+
+def handle_dose(args: argparse.Namespace) -> int:
+    try:
+        data = load_config()
+    except RuntimeError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    peptides = data.get("peptides", {})
+    entry = peptides.get(normalize_name(args.peptide))
+    if not entry:
+        print(f"Error: '{args.peptide}' not found. Use `pepcalc list`.", file=sys.stderr)
+        return 1
+    print(
+        format_output(
+            entry["name"],
+            entry["vial_mg"],
+            entry["recon_ml"],
+            entry["dose_mcg"],
+            entry.get("vial_size_ml"),
+        )
+    )
+    return 0
+
+
+def handle_edit(args: argparse.Namespace) -> int:
+    try:
+        data = load_config()
+    except RuntimeError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    peptides = data.get("peptides", {})
+    if not peptides:
+        print("No saved peptides.")
+        return 0
+
+    entry = None
+    if args.peptide:
+        entry = peptides.get(normalize_name(args.peptide))
+        if not entry:
+            print(f"Error: '{args.peptide}' not found. Use `pepcalc list`.", file=sys.stderr)
+            return 1
+    else:
+        entry = select_peptide(peptides)
+        if entry is None:
+            print("No peptide selected.")
+            return 0
+
+    original_key = normalize_name(entry["name"])
+    print(
+        f"Editing {entry['name']} "
+        f"(peptide: {fmt_num(entry['vial_mg'])}mg, "
+        f"BAC: {fmt_num(entry['recon_ml'])}mL, "
+        f"vial size: {fmt_num(get_vial_size_ml(entry))}mL, "
+        f"dose: {fmt_dose_with_units(entry)})"
+    )
+
+    data_inputs = gather_mix_inputs(entry)
+    print_mix_summary(data_inputs)
+
+    new_key = normalize_name(data_inputs["name"])
+    if new_key != original_key and new_key in peptides:
+        if not prompt_yes_no(f"Overwrite existing '{peptides[new_key]['name']}'", default=False):
+            print("Edit cancelled.")
+            return 0
+
+    if new_key != original_key:
+        peptides.pop(original_key, None)
+
+    peptides[new_key] = {
+        "name": data_inputs["name"],
+        "vial_mg": data_inputs["vial_mg"],
+        "recon_ml": data_inputs["recon_ml"],
+        "vial_size_ml": data_inputs["vial_size_ml"],
+        "dose_mcg": data_inputs["dose_mcg"],
+    }
+    if prompt_yes_no("Save changes", default=True):
+        try:
+            save_config(data)
+        except RuntimeError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        print(f"Updated {data_inputs['name']}.")
+    else:
+        print("Edit cancelled.")
+    return 0
+
+
+def handle_mix(_: argparse.Namespace) -> int:
+    try:
+        data = load_config()
+    except RuntimeError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    peptides = data.get("peptides", {})
+    entry = select_peptide(peptides)
+    data_inputs = gather_mix_inputs(entry)
+    print_mix_summary(data_inputs)
+
+    if prompt_yes_no("Save this peptide config", default=False):
+        data["peptides"][normalize_name(data_inputs["name"])] = {
+            "name": data_inputs["name"],
+            "vial_mg": data_inputs["vial_mg"],
+            "recon_ml": data_inputs["recon_ml"],
+            "vial_size_ml": data_inputs["vial_size_ml"],
+            "dose_mcg": data_inputs["dose_mcg"],
+        }
+        try:
+            save_config(data)
+        except RuntimeError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        print(f"Saved {data_inputs['name']}.")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="pepcalc",
+        description="Peptide reconstitution calculator",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Examples:\n  pepcalc calc BPC-157 5 2 250\n  pepcalc mix\n  pepcalc edit",
+    )
+    subparsers = parser.add_subparsers(dest="command")
+
+    calc = subparsers.add_parser("calc", help="calculate syringe units per dose")
+    calc.add_argument("peptide")
+    calc.add_argument("vial_mg")
+    calc.add_argument("recon_ml")
+    calc.add_argument("dose_mcg")
+    calc.set_defaults(func=handle_calc)
+
+    save = subparsers.add_parser("save", help="save a peptide config")
+    save.add_argument("peptide")
+    save.add_argument("vial_mg")
+    save.add_argument("recon_ml")
+    save.add_argument("dose_mcg")
+    save.add_argument("--vial-size-ml", help="vial size in mL (defaults to 3)")
+    save.set_defaults(func=handle_save)
+
+    list_cmd = subparsers.add_parser("list", help="list saved peptides")
+    list_cmd.set_defaults(func=handle_list)
+
+    dose = subparsers.add_parser("dose", help="calculate dose for a saved peptide")
+    dose.add_argument("peptide")
+    dose.set_defaults(func=handle_dose)
+
+    edit = subparsers.add_parser("edit", help="edit a saved peptide")
+    edit.add_argument("peptide", nargs="?")
+    edit.set_defaults(func=handle_edit)
+
+    mix = subparsers.add_parser("mix", help="interactive walkthrough for reconstitution volume")
+    mix.set_defaults(func=handle_mix)
+
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    if args.command is None:
+        print("Use `pepcalc -h` for help.")
+        print("Examples: pepcalc calc BPC-157 5 2 250 | pepcalc mix | pepcalc edit")
+        return 0
+    try:
+        return args.func(args)
+    except (UserExit, EOFError):
+        print("Exited.")
+        return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
