@@ -1,14 +1,31 @@
 #!/usr/bin/env python3
 import argparse
+import datetime
 import json
 import os
 import re
+import sqlite3
 import sys
 from pathlib import Path
 from typing import Optional, Tuple
 
 
 DEFAULT_VIAL_SIZE_ML = 3.0
+SCHEMA_VERSION = 5
+
+DAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+DAY_ALIASES = {
+    "m": 0, "mon": 0, "monday": 0,
+    "t": 1, "tu": 1, "tue": 1, "tuesday": 1,
+    "w": 2, "wed": 2, "wednesday": 2,
+    "th": 3, "thu": 3, "thursday": 3,
+    "f": 4, "fri": 4, "friday": 4,
+    "sa": 5, "sat": 5, "saturday": 5,
+    "su": 6, "sun": 6, "sunday": 6,
+}
+
+
+# ── Config directory ─────────────────────────────────────────────────────────
 
 
 def get_config_dir() -> Path:
@@ -24,10 +41,14 @@ def get_config_dir() -> Path:
 
 CONFIG_DIR = get_config_dir()
 CONFIG_PATH = CONFIG_DIR / "peptides.json"
+DB_PATH = CONFIG_DIR / "pepcalc.db"
 
 
 class UserExit(Exception):
     pass
+
+
+# ── Formatting helpers ───────────────────────────────────────────────────────
 
 
 def normalize_name(name: str) -> str:
@@ -39,10 +60,13 @@ def fmt_num(value: float, max_dec: int = 2) -> str:
     return text if text else "0"
 
 
-def get_vial_size_ml(entry: Optional[dict]) -> float:
+def get_vial_size_ml(entry) -> float:
     if not entry:
         return DEFAULT_VIAL_SIZE_ML
-    value = entry.get("vial_size_ml")
+    try:
+        value = entry["vial_size_ml"]
+    except (KeyError, TypeError):
+        value = entry.get("vial_size_ml") if isinstance(entry, dict) else None
     return float(value) if value else DEFAULT_VIAL_SIZE_ML
 
 
@@ -98,7 +122,7 @@ def fmt_dose(mcg: float) -> str:
     return f"{fmt_num(mcg)}mcg"
 
 
-def fmt_dose_with_units(entry: dict) -> str:
+def fmt_dose_with_units(entry) -> str:
     result = calculate(entry["vial_mg"], entry["recon_ml"], entry["dose_mcg"])
     dose_mcg = entry["dose_mcg"]
     dose_mg = dose_mcg / 1000.0
@@ -109,6 +133,630 @@ def fmt_dose_with_units(entry: dict) -> str:
         primary = f"{fmt_num(dose_mcg)}mcg"
         secondary = f"{fmt_num(dose_mg, 4)}mg"
     return f"{primary} ({secondary}, {fmt_num(result['units'])}u)"
+
+
+# ── Database layer ───────────────────────────────────────────────────────────
+
+
+def get_db() -> sqlite3.Connection:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    is_new = not DB_PATH.exists()
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    if is_new:
+        init_schema(conn)
+        migrate_json(conn)
+    else:
+        maybe_upgrade_schema(conn)
+    return conn
+
+
+def init_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
+
+        CREATE TABLE IF NOT EXISTS peptides (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            key          TEXT NOT NULL UNIQUE,
+            name         TEXT NOT NULL,
+            vial_mg      REAL NOT NULL,
+            recon_ml     REAL NOT NULL,
+            dose_mcg     REAL NOT NULL,
+            vial_size_ml REAL NOT NULL DEFAULT 3.0,
+            notes        TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS syringes (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            name          TEXT NOT NULL,
+            brand         TEXT,
+            gauge         INTEGER,
+            capacity_cc   REAL NOT NULL,
+            needle_length TEXT,
+            description   TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS supplies (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            name        TEXT NOT NULL,
+            category    TEXT,
+            description TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS suppliers (
+            id   INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            url  TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS supplier_items (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            supplier_id INTEGER NOT NULL REFERENCES suppliers(id) ON DELETE CASCADE,
+            item_type   TEXT NOT NULL CHECK(item_type IN ('peptide', 'syringe', 'supply')),
+            item_id     INTEGER NOT NULL,
+            price       REAL,
+            notes       TEXT,
+            UNIQUE(supplier_id, item_type, item_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS protocol_entries (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            peptide_id  INTEGER NOT NULL REFERENCES peptides(id) ON DELETE CASCADE,
+            syringe_id  INTEGER REFERENCES syringes(id) ON DELETE SET NULL,
+            time_of_day TEXT NOT NULL DEFAULT 'night' CHECK(time_of_day IN ('morning', 'night')),
+            UNIQUE(peptide_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS protocol_days (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            protocol_entry_id INTEGER NOT NULL REFERENCES protocol_entries(id) ON DELETE CASCADE,
+            day_of_week       INTEGER NOT NULL CHECK(day_of_week BETWEEN 0 AND 6),
+            UNIQUE(protocol_entry_id, day_of_week)
+        );
+
+        CREATE TABLE IF NOT EXISTS vials (
+            id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+            peptide_id         INTEGER NOT NULL REFERENCES peptides(id) ON DELETE CASCADE,
+            state              TEXT NOT NULL DEFAULT 'lyophilized'
+                               CHECK(state IN ('lyophilized', 'reconstituted')),
+            reconstituted_date TEXT,
+            notes              TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS courses (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            peptide_id      INTEGER NOT NULL REFERENCES peptides(id) ON DELETE CASCADE,
+            duration_min    INTEGER NOT NULL,
+            duration_max    INTEGER,
+            target_duration INTEGER,
+            gap_days        INTEGER,
+            active_start    TEXT,
+            last_completed  TEXT,
+            notes           TEXT,
+            UNIQUE(peptide_id)
+        );
+    """)
+    conn.execute("DELETE FROM schema_version")
+    conn.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
+    conn.commit()
+
+
+def maybe_upgrade_schema(conn: sqlite3.Connection) -> None:
+    try:
+        row = conn.execute("SELECT version FROM schema_version").fetchone()
+    except sqlite3.OperationalError:
+        init_schema(conn)
+        migrate_json(conn)
+        return
+    if row is None:
+        init_schema(conn)
+        migrate_json(conn)
+        return
+    if row["version"] < 2:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS vials (
+                id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                peptide_id         INTEGER NOT NULL REFERENCES peptides(id) ON DELETE CASCADE,
+                state              TEXT NOT NULL DEFAULT 'lyophilized'
+                                   CHECK(state IN ('lyophilized', 'reconstituted')),
+                reconstituted_date TEXT,
+                notes              TEXT
+            )
+        """)
+        conn.execute("UPDATE schema_version SET version = 2")
+        conn.commit()
+    if row["version"] < 3:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS courses (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                peptide_id      INTEGER NOT NULL REFERENCES peptides(id) ON DELETE CASCADE,
+                duration_min    INTEGER NOT NULL,
+                duration_max    INTEGER,
+                target_duration INTEGER,
+                gap_days        INTEGER,
+                active_start    TEXT,
+                last_completed  TEXT,
+                notes           TEXT,
+                UNIQUE(peptide_id)
+            )
+        """)
+        conn.execute("UPDATE schema_version SET version = 3")
+        conn.commit()
+    if row["version"] < 4:
+        conn.execute("ALTER TABLE peptides ADD COLUMN notes TEXT")
+        conn.execute("UPDATE schema_version SET version = 4")
+        conn.commit()
+    if row["version"] < 5:
+        conn.execute("ALTER TABLE courses ADD COLUMN target_duration INTEGER")
+        conn.execute("UPDATE courses SET target_duration = duration_min WHERE target_duration IS NULL")
+        conn.execute("UPDATE schema_version SET version = 5")
+        conn.commit()
+
+
+def migrate_json(conn: sqlite3.Connection) -> None:
+    if not CONFIG_PATH.exists():
+        return
+    try:
+        data = json.loads(CONFIG_PATH.read_text())
+    except (json.JSONDecodeError, OSError):
+        return
+    peptides = data.get("peptides", {})
+    if not isinstance(peptides, dict):
+        return
+    migrated = 0
+    for key, entry in peptides.items():
+        if not isinstance(entry, dict):
+            continue
+        try:
+            conn.execute(
+                "INSERT OR IGNORE INTO peptides (key, name, vial_mg, recon_ml, dose_mcg, vial_size_ml) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    normalize_name(key),
+                    entry.get("name", key),
+                    float(entry["vial_mg"]),
+                    float(entry["recon_ml"]),
+                    float(entry["dose_mcg"]),
+                    float(entry.get("vial_size_ml", DEFAULT_VIAL_SIZE_ML)),
+                ),
+            )
+            migrated += 1
+        except (KeyError, ValueError, TypeError):
+            continue
+    conn.commit()
+    if migrated > 0:
+        migrated_path = CONFIG_PATH.with_suffix(".json.migrated")
+        try:
+            CONFIG_PATH.rename(migrated_path)
+        except OSError:
+            pass
+
+
+# ── Peptide DB helpers ───────────────────────────────────────────────────────
+
+
+def db_list_peptides(conn: sqlite3.Connection) -> list:
+    return conn.execute(
+        "SELECT * FROM peptides ORDER BY name COLLATE NOCASE"
+    ).fetchall()
+
+
+def db_get_peptide(conn: sqlite3.Connection, name: str) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM peptides WHERE key = ?", (normalize_name(name),)
+    ).fetchone()
+
+
+def db_get_peptide_by_id(conn: sqlite3.Connection, peptide_id: int) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM peptides WHERE id = ?", (peptide_id,)
+    ).fetchone()
+
+
+def db_save_peptide(conn: sqlite3.Connection, name: str, vial_mg: float,
+                    recon_ml: float, dose_mcg: float, vial_size_ml: float,
+                    notes: Optional[str] = None) -> None:
+    key = normalize_name(name)
+    conn.execute(
+        "INSERT INTO peptides (key, name, vial_mg, recon_ml, dose_mcg, vial_size_ml, notes) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET name=?, vial_mg=?, recon_ml=?, dose_mcg=?, vial_size_ml=?, notes=?",
+        (key, name, vial_mg, recon_ml, dose_mcg, vial_size_ml, notes,
+         name, vial_mg, recon_ml, dose_mcg, vial_size_ml, notes),
+    )
+    conn.commit()
+
+
+def db_update_peptide_notes(conn: sqlite3.Connection, peptide_id: int, notes: Optional[str]) -> None:
+    conn.execute("UPDATE peptides SET notes = ? WHERE id = ?", (notes, peptide_id))
+    conn.commit()
+
+
+def db_delete_peptide(conn: sqlite3.Connection, key: str) -> None:
+    conn.execute("DELETE FROM peptides WHERE key = ?", (normalize_name(key),))
+    conn.commit()
+
+
+# ── Syringe DB helpers ───────────────────────────────────────────────────────
+
+
+def db_list_syringes(conn: sqlite3.Connection) -> list:
+    return conn.execute(
+        "SELECT * FROM syringes ORDER BY name COLLATE NOCASE"
+    ).fetchall()
+
+
+def db_get_syringe(conn: sqlite3.Connection, syringe_id: int) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM syringes WHERE id = ?", (syringe_id,)
+    ).fetchone()
+
+
+def db_add_syringe(conn: sqlite3.Connection, name: str, brand: Optional[str],
+                   gauge: Optional[int], capacity_cc: float,
+                   needle_length: Optional[str], description: Optional[str]) -> int:
+    cur = conn.execute(
+        "INSERT INTO syringes (name, brand, gauge, capacity_cc, needle_length, description) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (name, brand, gauge, capacity_cc, needle_length, description),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def db_update_syringe(conn: sqlite3.Connection, syringe_id: int, name: str,
+                      brand: Optional[str], gauge: Optional[int], capacity_cc: float,
+                      needle_length: Optional[str], description: Optional[str]) -> None:
+    conn.execute(
+        "UPDATE syringes SET name=?, brand=?, gauge=?, capacity_cc=?, needle_length=?, description=? "
+        "WHERE id=?",
+        (name, brand, gauge, capacity_cc, needle_length, description, syringe_id),
+    )
+    conn.commit()
+
+
+def db_delete_syringe(conn: sqlite3.Connection, syringe_id: int) -> None:
+    conn.execute("DELETE FROM syringes WHERE id = ?", (syringe_id,))
+    conn.commit()
+
+
+# ── Supply DB helpers ────────────────────────────────────────────────────────
+
+
+def db_list_supplies(conn: sqlite3.Connection) -> list:
+    return conn.execute(
+        "SELECT * FROM supplies ORDER BY name COLLATE NOCASE"
+    ).fetchall()
+
+
+def db_get_supply(conn: sqlite3.Connection, supply_id: int) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM supplies WHERE id = ?", (supply_id,)
+    ).fetchone()
+
+
+def db_add_supply(conn: sqlite3.Connection, name: str, category: Optional[str],
+                  description: Optional[str]) -> int:
+    cur = conn.execute(
+        "INSERT INTO supplies (name, category, description) VALUES (?, ?, ?)",
+        (name, category, description),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def db_update_supply(conn: sqlite3.Connection, supply_id: int, name: str,
+                     category: Optional[str], description: Optional[str]) -> None:
+    conn.execute(
+        "UPDATE supplies SET name=?, category=?, description=? WHERE id=?",
+        (name, category, description, supply_id),
+    )
+    conn.commit()
+
+
+def db_delete_supply(conn: sqlite3.Connection, supply_id: int) -> None:
+    conn.execute("DELETE FROM supplies WHERE id = ?", (supply_id,))
+    conn.commit()
+
+
+# ── Supplier DB helpers ──────────────────────────────────────────────────────
+
+
+def db_list_suppliers(conn: sqlite3.Connection) -> list:
+    return conn.execute(
+        "SELECT * FROM suppliers ORDER BY name COLLATE NOCASE"
+    ).fetchall()
+
+
+def db_get_supplier(conn: sqlite3.Connection, supplier_id: int) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM suppliers WHERE id = ?", (supplier_id,)
+    ).fetchone()
+
+
+def db_add_supplier(conn: sqlite3.Connection, name: str, url: Optional[str]) -> int:
+    cur = conn.execute(
+        "INSERT INTO suppliers (name, url) VALUES (?, ?)",
+        (name, url),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def db_update_supplier(conn: sqlite3.Connection, supplier_id: int, name: str,
+                       url: Optional[str]) -> None:
+    conn.execute(
+        "UPDATE suppliers SET name=?, url=? WHERE id=?",
+        (name, url, supplier_id),
+    )
+    conn.commit()
+
+
+def db_delete_supplier(conn: sqlite3.Connection, supplier_id: int) -> None:
+    conn.execute("DELETE FROM suppliers WHERE id = ?", (supplier_id,))
+    conn.commit()
+
+
+def db_list_supplier_items(conn: sqlite3.Connection, supplier_id: int) -> list:
+    return conn.execute(
+        "SELECT * FROM supplier_items WHERE supplier_id = ?", (supplier_id,)
+    ).fetchall()
+
+
+def db_link_supplier_item(conn: sqlite3.Connection, supplier_id: int,
+                          item_type: str, item_id: int,
+                          price: Optional[float], notes: Optional[str]) -> None:
+    conn.execute(
+        "INSERT INTO supplier_items (supplier_id, item_type, item_id, price, notes) "
+        "VALUES (?, ?, ?, ?, ?) "
+        "ON CONFLICT(supplier_id, item_type, item_id) DO UPDATE SET price=?, notes=?",
+        (supplier_id, item_type, item_id, price, notes, price, notes),
+    )
+    conn.commit()
+
+
+def db_unlink_supplier_item(conn: sqlite3.Connection, link_id: int) -> None:
+    conn.execute("DELETE FROM supplier_items WHERE id = ?", (link_id,))
+    conn.commit()
+
+
+# ── Protocol DB helpers ──────────────────────────────────────────────────────
+
+
+def db_list_protocol(conn: sqlite3.Connection) -> list:
+    return conn.execute(
+        "SELECT pe.id, pe.peptide_id, pe.syringe_id, pe.time_of_day, "
+        "p.name AS peptide_name, p.vial_mg, p.recon_ml, p.dose_mcg, p.vial_size_ml, "
+        "s.name AS syringe_name, s.capacity_cc "
+        "FROM protocol_entries pe "
+        "JOIN peptides p ON pe.peptide_id = p.id "
+        "LEFT JOIN syringes s ON pe.syringe_id = s.id "
+        "ORDER BY pe.time_of_day, p.name COLLATE NOCASE"
+    ).fetchall()
+
+
+def db_get_protocol_days(conn: sqlite3.Connection, entry_id: int) -> list:
+    rows = conn.execute(
+        "SELECT day_of_week FROM protocol_days WHERE protocol_entry_id = ? ORDER BY day_of_week",
+        (entry_id,),
+    ).fetchall()
+    return [r["day_of_week"] for r in rows]
+
+
+def db_add_protocol_entry(conn: sqlite3.Connection, peptide_id: int,
+                          syringe_id: Optional[int], time_of_day: str,
+                          days: list) -> int:
+    cur = conn.execute(
+        "INSERT INTO protocol_entries (peptide_id, syringe_id, time_of_day) VALUES (?, ?, ?)",
+        (peptide_id, syringe_id, time_of_day),
+    )
+    entry_id = cur.lastrowid
+    for d in days:
+        conn.execute(
+            "INSERT INTO protocol_days (protocol_entry_id, day_of_week) VALUES (?, ?)",
+            (entry_id, d),
+        )
+    conn.commit()
+    return entry_id
+
+
+def db_update_protocol_entry(conn: sqlite3.Connection, entry_id: int,
+                             syringe_id: Optional[int], time_of_day: str,
+                             days: list) -> None:
+    conn.execute(
+        "UPDATE protocol_entries SET syringe_id=?, time_of_day=? WHERE id=?",
+        (syringe_id, time_of_day, entry_id),
+    )
+    conn.execute("DELETE FROM protocol_days WHERE protocol_entry_id = ?", (entry_id,))
+    for d in days:
+        conn.execute(
+            "INSERT INTO protocol_days (protocol_entry_id, day_of_week) VALUES (?, ?)",
+            (entry_id, d),
+        )
+    conn.commit()
+
+
+def db_delete_protocol_entry(conn: sqlite3.Connection, entry_id: int) -> None:
+    conn.execute("DELETE FROM protocol_entries WHERE id = ?", (entry_id,))
+    conn.commit()
+
+
+def db_get_schedule_for_day(conn: sqlite3.Connection, day_of_week: int,
+                            time_of_day: Optional[str] = None) -> list:
+    sql = (
+        "SELECT pe.id, pe.peptide_id, pe.syringe_id, pe.time_of_day, "
+        "p.name AS peptide_name, p.vial_mg, p.recon_ml, p.dose_mcg, p.vial_size_ml, p.notes AS peptide_notes, "
+        "s.name AS syringe_name, s.capacity_cc "
+        "FROM protocol_entries pe "
+        "JOIN peptides p ON pe.peptide_id = p.id "
+        "LEFT JOIN syringes s ON pe.syringe_id = s.id "
+        "JOIN protocol_days pd ON pd.protocol_entry_id = pe.id "
+        "WHERE pd.day_of_week = ?"
+    )
+    params = [day_of_week]
+    if time_of_day:
+        sql += " AND pe.time_of_day = ?"
+        params.append(time_of_day)
+    sql += " ORDER BY pe.time_of_day, p.name COLLATE NOCASE"
+    return conn.execute(sql, params).fetchall()
+
+
+# ── Vial DB helpers ──────────────────────────────────────────────────────────
+
+
+def db_list_vials(conn: sqlite3.Connection) -> list:
+    return conn.execute(
+        "SELECT v.*, p.name AS peptide_name, p.vial_mg "
+        "FROM vials v "
+        "JOIN peptides p ON v.peptide_id = p.id "
+        "ORDER BY p.name COLLATE NOCASE, v.state, v.id"
+    ).fetchall()
+
+
+def db_add_vial(conn: sqlite3.Connection, peptide_id: int, state: str = "lyophilized",
+                reconstituted_date: Optional[str] = None, notes: Optional[str] = None) -> int:
+    cur = conn.execute(
+        "INSERT INTO vials (peptide_id, state, reconstituted_date, notes) VALUES (?, ?, ?, ?)",
+        (peptide_id, state, reconstituted_date, notes),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def db_update_vial_state(conn: sqlite3.Connection, vial_id: int, state: str,
+                         reconstituted_date: Optional[str] = None) -> None:
+    conn.execute(
+        "UPDATE vials SET state = ?, reconstituted_date = ? WHERE id = ?",
+        (state, reconstituted_date, vial_id),
+    )
+    conn.commit()
+
+
+def db_delete_vial(conn: sqlite3.Connection, vial_id: int) -> None:
+    conn.execute("DELETE FROM vials WHERE id = ?", (vial_id,))
+    conn.commit()
+
+
+# ── Course DB helpers ────────────────────────────────────────────────────
+
+
+def db_get_course(conn: sqlite3.Connection, peptide_id: int) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM courses WHERE peptide_id = ?", (peptide_id,)
+    ).fetchone()
+
+
+def db_list_courses(conn: sqlite3.Connection) -> list:
+    return conn.execute(
+        "SELECT c.*, p.name AS peptide_name "
+        "FROM courses c JOIN peptides p ON c.peptide_id = p.id "
+        "ORDER BY p.name COLLATE NOCASE"
+    ).fetchall()
+
+
+def db_add_course(conn: sqlite3.Connection, peptide_id: int, duration_min: int,
+                  duration_max: Optional[int], target_duration: Optional[int],
+                  gap_days: Optional[int], notes: Optional[str]) -> int:
+    cur = conn.execute(
+        "INSERT INTO courses (peptide_id, duration_min, duration_max, target_duration, gap_days, notes) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (peptide_id, duration_min, duration_max, target_duration or duration_min, gap_days, notes),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def db_update_course(conn: sqlite3.Connection, course_id: int, duration_min: int,
+                     duration_max: Optional[int], target_duration: Optional[int],
+                     gap_days: Optional[int], notes: Optional[str]) -> None:
+    conn.execute(
+        "UPDATE courses SET duration_min=?, duration_max=?, target_duration=?, gap_days=?, notes=? WHERE id=?",
+        (duration_min, duration_max, target_duration or duration_min, gap_days, notes, course_id),
+    )
+    conn.commit()
+
+
+def db_start_course(conn: sqlite3.Connection, course_id: int, start_date: str) -> None:
+    conn.execute(
+        "UPDATE courses SET active_start = ? WHERE id = ?",
+        (start_date, course_id),
+    )
+    conn.commit()
+
+
+def db_stop_course(conn: sqlite3.Connection, course_id: int, end_date: str) -> None:
+    conn.execute(
+        "UPDATE courses SET active_start = NULL, last_completed = ? WHERE id = ?",
+        (end_date, course_id),
+    )
+    conn.commit()
+
+
+def db_delete_course(conn: sqlite3.Connection, course_id: int) -> None:
+    conn.execute("DELETE FROM courses WHERE id = ?", (course_id,))
+    conn.commit()
+
+
+def get_course_status(conn: sqlite3.Connection, peptide_id: int) -> Optional[dict]:
+    """Return course status dict or None if no course tracking."""
+    course = db_get_course(conn, peptide_id)
+    if not course:
+        return None
+    today = datetime.date.today()
+    status = {
+        "course": course,
+        "active": False,
+        "day_number": 0,
+        "past_min": False,
+        "past_max": False,
+        "off_cycle": True,
+        "next_due_date": None,
+    }
+    if course["active_start"]:
+        start = datetime.date.fromisoformat(course["active_start"])
+        day_num = (today - start).days + 1
+        status["active"] = True
+        status["off_cycle"] = False
+        status["day_number"] = day_num
+        status["past_min"] = day_num > course["duration_min"]
+        if course["duration_max"]:
+            status["past_max"] = day_num > course["duration_max"]
+    elif course["last_completed"] and course["gap_days"]:
+        last = datetime.date.fromisoformat(course["last_completed"])
+        next_due = last + datetime.timedelta(days=course["gap_days"])
+        status["next_due_date"] = next_due
+    return status
+
+
+def check_course_warnings(conn: sqlite3.Connection, peptide_id: int,
+                          peptide_name: str, interactive: bool = False) -> bool:
+    """Print course warnings. If interactive, prompt to continue. Returns True to proceed."""
+    status = get_course_status(conn, peptide_id)
+    if not status:
+        return True
+    course = status["course"]
+    dur = f"{course['duration_min']}"
+    if course["duration_max"]:
+        dur += f"-{course['duration_max']}"
+    if status["active"]:
+        if status["past_max"]:
+            print(f"Note: {peptide_name} course is at day {status['day_number']} (max {course['duration_max']}). Consider ending the course.")
+        elif status["past_min"]:
+            print(f"Note: {peptide_name}: Day {status['day_number']} of {dur} day course — consider ending soon.")
+    else:
+        msg = f"Note: {peptide_name} is off-cycle."
+        if status["next_due_date"]:
+            msg += f" Next course due ~{status['next_due_date'].strftime('%b %-d')}."
+        print(msg)
+    if interactive and (not status["active"] or status["past_max"]):
+        if not prompt_yes_no("Continue", default=True):
+            return False
+    return True
+
+
+# ── Calculation ──────────────────────────────────────────────────────────────
 
 
 def recommend_target_ml(
@@ -129,12 +777,366 @@ def recommend_target_ml(
     return recommended_units / 100.0, recommended_units, max_units, max_units_by_vial
 
 
-def gather_mix_inputs(entry: Optional[dict]) -> dict:
+def calculate(vial_mg: float, recon_ml: float, dose_mcg: float) -> dict:
+    concentration_mg_ml = vial_mg / recon_ml
+    concentration_mcg_ml = concentration_mg_ml * 1000.0
+    units = (dose_mcg / concentration_mcg_ml) * 100.0
+    return {
+        "concentration_mg_ml": concentration_mg_ml,
+        "concentration_mcg_ml": concentration_mcg_ml,
+        "units": units,
+    }
+
+
+def format_output(
+    name: str,
+    vial_mg: float,
+    recon_ml: float,
+    dose_mcg: float,
+    vial_size_ml: Optional[float] = None,
+) -> str:
+    result = calculate(vial_mg, recon_ml, dose_mcg)
+    line1 = f"{name} (peptide: {fmt_num(vial_mg)}mg, BAC: {fmt_num(recon_ml)}mL"
+    if vial_size_ml:
+        line1 += f", vial size: {fmt_num(vial_size_ml)}mL"
+    line1 += ")"
+    line2 = (
+        "Concentration: "
+        f"{fmt_num(result['concentration_mg_ml'])}mg/mL "
+        f"({fmt_num(result['concentration_mcg_ml'])}mcg/mL)"
+    )
+    line3 = f"Dose: {fmt_dose(dose_mcg)} = {fmt_num(result['units'])} units"
+    return "\n".join([line1, line2, line3])
+
+
+# ── Interactive prompts ──────────────────────────────────────────────────────
+
+
+def prompt_text(label: str, default: Optional[str] = None, required: bool = False) -> str:
+    while True:
+        suffix = f" [{default}]" if default is not None else ""
+        value = input(f"{label}{suffix}: ").strip()
+        if value.lower() in ("q", "quit", "exit"):
+            raise UserExit()
+        if value:
+            return value
+        if default is not None:
+            return default
+        if not required:
+            return ""
+        print("Please enter a value.")
+
+
+def prompt_positive_float(label: str, default: Optional[float] = None) -> float:
+    while True:
+        suffix = f" [{fmt_num(default)}]" if default is not None else ""
+        raw = input(f"{label}{suffix}: ").strip()
+        if raw.lower() in ("q", "quit", "exit"):
+            raise UserExit()
+        if not raw:
+            if default is not None:
+                return float(default)
+            print("Please enter a value.")
+            continue
+        try:
+            value = float(raw)
+        except ValueError:
+            print("Please enter a number.")
+            continue
+        if value <= 0:
+            print("Value must be greater than 0.")
+            continue
+        return value
+
+
+def prompt_optional_float(label: str, default: Optional[float] = None) -> Optional[float]:
+    while True:
+        if default is not None:
+            suffix = f" [{fmt_num(default)}]"
+        else:
+            suffix = " [skip]"
+        raw = input(f"{label}{suffix}: ").strip()
+        if raw.lower() in ("q", "quit", "exit"):
+            raise UserExit()
+        if not raw:
+            return default
+        try:
+            value = float(raw)
+        except ValueError:
+            print("Please enter a number or press Enter to skip.")
+            continue
+        if value <= 0:
+            print("Value must be greater than 0.")
+            continue
+        return value
+
+
+def prompt_optional_int(label: str, default: Optional[int] = None) -> Optional[int]:
+    while True:
+        if default is not None:
+            suffix = f" [{default}]"
+        else:
+            suffix = " [skip]"
+        raw = input(f"{label}{suffix}: ").strip()
+        if raw.lower() in ("q", "quit", "exit"):
+            raise UserExit()
+        if not raw:
+            return default
+        try:
+            value = int(raw)
+        except ValueError:
+            print("Please enter an integer or press Enter to skip.")
+            continue
+        if value <= 0:
+            print("Value must be greater than 0.")
+            continue
+        return value
+
+
+def prompt_dose_mcg(label: str, default: Optional[float] = None) -> float:
+    suffix = f" [{fmt_dose(default)}]" if default is not None else ""
+    while True:
+        raw = input(f"{label} (mcg or mg){suffix}: ").strip()
+        if raw.lower() in ("q", "quit", "exit"):
+            raise UserExit()
+        if not raw:
+            if default is not None:
+                return float(default)
+            print("Please enter a value.")
+            continue
+        try:
+            return parse_dose_input(raw, label)
+        except ValueError as exc:
+            print(exc)
+
+
+def prompt_target_volume(default_ml: Optional[float]) -> float:
+    suffix = ""
+    if default_ml is not None:
+        suffix = f" [{fmt_num(default_ml)}mL ({fmt_num(default_ml * 100)}u)]"
+    while True:
+        raw = input(f"Target volume per dose (mL or units){suffix}: ").strip()
+        if raw.lower() in ("q", "quit", "exit"):
+            raise UserExit()
+        if not raw:
+            if default_ml is not None:
+                return float(default_ml)
+            print("Please enter a value.")
+            continue
+        try:
+            value_ml, kind = parse_volume_or_units_input(raw, "target volume")
+        except ValueError as exc:
+            print(exc)
+            continue
+        if kind == "none" and value_ml > 1:
+            value_ml = value_ml / 100.0
+        return value_ml
+
+
+def prompt_yes_no(label: str, default: bool = False) -> bool:
+    suffix = " [Y/n]" if default else " [y/N]"
+    while True:
+        raw = input(f"{label}{suffix}: ").strip().lower()
+        if raw in ("q", "quit", "exit"):
+            raise UserExit()
+        if not raw:
+            return default
+        if raw in ("y", "yes"):
+            return True
+        if raw in ("n", "no"):
+            return False
+        print("Please enter y or n.")
+
+
+def prompt_choice(label: str, options: list, display_fn=None) -> Optional[int]:
+    if not options:
+        return None
+    for idx, item in enumerate(options, start=1):
+        line = display_fn(item) if display_fn else str(item)
+        print(f"{idx}) {line}")
+    while True:
+        raw = input(f"{label}: ").strip()
+        if raw.lower() in ("q", "quit", "exit"):
+            raise UserExit()
+        if not raw:
+            return None
+        if raw.isdigit():
+            choice = int(raw)
+            if 1 <= choice <= len(options):
+                return choice - 1
+        print("Invalid choice.")
+
+
+# ── Peptide selector (updated for DB) ───────────────────────────────────────
+
+
+def select_peptide_db(conn: sqlite3.Connection) -> Optional[sqlite3.Row]:
+    entries = db_list_peptides(conn)
+    if not entries:
+        return None
+    print("Saved peptides:")
+    for idx, entry in enumerate(entries, start=1):
+        print(
+            f"{idx}) {entry['name']} "
+            f"(peptide: {fmt_num(entry['vial_mg'])}mg, "
+            f"BAC: {fmt_num(entry['recon_ml'])}mL, "
+            f"vial size: {fmt_num(get_vial_size_ml(entry))}mL, "
+            f"dose: {fmt_dose_with_units(entry)})"
+        )
+    print("0) New peptide")
+    while True:
+        raw = input("Select peptide [0]: ").strip()
+        if raw.lower() in ("q", "quit", "exit"):
+            raise UserExit()
+        if not raw:
+            return None
+        if raw.isdigit():
+            choice = int(raw)
+            if choice == 0:
+                return None
+            if 1 <= choice <= len(entries):
+                return entries[choice - 1]
+        match = db_get_peptide(conn, raw)
+        if match:
+            return match
+        print("Invalid choice.")
+
+
+def select_syringe(conn: sqlite3.Connection) -> Optional[sqlite3.Row]:
+    syringes = db_list_syringes(conn)
+    if not syringes:
+        print("No syringes saved. Use `pepcalc syringe add` first.")
+        return None
+    print("Syringes:")
+    for idx, s in enumerate(syringes, start=1):
+        desc = fmt_syringe(s)
+        print(f"{idx}) {desc}")
+    print("0) None")
+    while True:
+        raw = input("Select syringe [0]: ").strip()
+        if raw.lower() in ("q", "quit", "exit"):
+            raise UserExit()
+        if not raw:
+            return None
+        if raw.isdigit():
+            choice = int(raw)
+            if choice == 0:
+                return None
+            if 1 <= choice <= len(syringes):
+                return syringes[choice - 1]
+        print("Invalid choice.")
+
+
+def fmt_syringe(s) -> str:
+    parts = [s["name"]]
+    if s["gauge"]:
+        parts.append(f"{s['gauge']}g")
+    parts.append(f"{fmt_num(s['capacity_cc'])}cc")
+    if s["needle_length"]:
+        parts.append(s["needle_length"])
+    return " ".join(parts)
+
+
+# ── Days parsing ─────────────────────────────────────────────────────────────
+
+
+def parse_days_input(raw: str) -> list:
+    text = raw.strip().lower()
+    if text in ("daily", "everyday", "every day", "all"):
+        return list(range(7))
+    if text in ("weekdays", "weekday"):
+        return list(range(5))
+    if text in ("weekends", "weekend"):
+        return [5, 6]
+    # Try "MWF" style (single letters for unambiguous days)
+    if re.fullmatch(r"[mtwfsa]{1,7}", text) and len(text) <= 7:
+        days = set()
+        for ch in text:
+            if ch == "m":
+                days.add(0)
+            elif ch == "t":
+                days.add(1)
+            elif ch == "w":
+                days.add(2)
+            elif ch == "h":
+                days.add(3)
+            elif ch == "f":
+                days.add(4)
+            elif ch == "s":
+                days.add(5)
+            elif ch == "a":
+                # 'a' = saturday (sa) when used in single-char mode? No, ambiguous.
+                # Let's just fall through to comma-separated
+                pass
+        if days:
+            return sorted(days)
+    # Try comma/space separated: "Mon, Wed, Fri" or "mon wed fri"
+    parts = re.split(r"[,\s]+", text)
+    days = set()
+    for part in parts:
+        part = part.strip().rstrip(",")
+        if not part:
+            continue
+        if part in DAY_ALIASES:
+            days.add(DAY_ALIASES[part])
+        else:
+            raise ValueError(f"Unknown day: '{part}'. Use Mon,Tue,Wed,Thu,Fri,Sat,Sun or 'daily'.")
+    if not days:
+        raise ValueError("No days specified.")
+    return sorted(days)
+
+
+def format_days(days: list) -> str:
+    if days == list(range(7)):
+        return "daily"
+    if days == list(range(5)):
+        return "weekdays"
+    if days == [5, 6]:
+        return "weekends"
+    return ", ".join(DAY_NAMES[d] for d in sorted(days))
+
+
+def prompt_days(default: Optional[list] = None) -> list:
+    default_str = format_days(default) if default else None
+    while True:
+        suffix = f" [{default_str}]" if default_str else ""
+        raw = input(f"Days (e.g. MWF, Mon,Wed,Fri, daily, weekdays){suffix}: ").strip()
+        if raw.lower() in ("q", "quit", "exit"):
+            raise UserExit()
+        if not raw:
+            if default is not None:
+                return default
+            print("Please enter days.")
+            continue
+        try:
+            return parse_days_input(raw)
+        except ValueError as exc:
+            print(exc)
+
+
+def prompt_time_of_day(default: str = "night") -> str:
+    while True:
+        raw = input(f"Time of day (morning/night) [{default}]: ").strip().lower()
+        if raw in ("q", "quit", "exit"):
+            raise UserExit()
+        if not raw:
+            return default
+        if raw in ("morning", "m", "am"):
+            return "morning"
+        if raw in ("night", "n", "pm", "evening"):
+            return "night"
+        print("Please enter 'morning' or 'night'.")
+
+
+# ── Mix workflow ─────────────────────────────────────────────────────────────
+
+
+def gather_mix_inputs(entry) -> dict:
     name_default = entry["name"] if entry else None
     name = prompt_text("Peptide name", default=name_default, required=True)
-    vial_default = entry.get("vial_mg") if entry else None
-    dose_default = entry.get("dose_mcg") if entry else None
-    recon_default = entry.get("recon_ml") if entry else None
+    vial_default = entry["vial_mg"] if entry else None
+    dose_default = entry["dose_mcg"] if entry else None
+    recon_default = entry["recon_ml"] if entry else None
     vial_size_default = get_vial_size_ml(entry) if entry else DEFAULT_VIAL_SIZE_ML
 
     vial_mg = prompt_positive_float("Peptide amount (mg)", default=vial_default)
@@ -231,128 +1233,7 @@ def print_mix_summary(data: dict) -> None:
         )
 
 
-def prompt_text(label: str, default: Optional[str] = None, required: bool = False) -> str:
-    while True:
-        suffix = f" [{default}]" if default is not None else ""
-        value = input(f"{label}{suffix}: ").strip()
-        if value.lower() in ("q", "quit", "exit"):
-            raise UserExit()
-        if value:
-            return value
-        if default is not None:
-            return default
-        if not required:
-            return ""
-        print("Please enter a value.")
-
-
-def prompt_positive_float(label: str, default: Optional[float] = None) -> float:
-    while True:
-        suffix = f" [{fmt_num(default)}]" if default is not None else ""
-        raw = input(f"{label}{suffix}: ").strip()
-        if raw.lower() in ("q", "quit", "exit"):
-            raise UserExit()
-        if not raw:
-            if default is not None:
-                return float(default)
-            print("Please enter a value.")
-            continue
-        try:
-            value = float(raw)
-        except ValueError:
-            print("Please enter a number.")
-            continue
-        if value <= 0:
-            print("Value must be greater than 0.")
-            continue
-        return value
-
-
-def prompt_dose_mcg(label: str, default: Optional[float] = None) -> float:
-    suffix = f" [{fmt_dose(default)}]" if default is not None else ""
-    while True:
-        raw = input(f"{label} (mcg or mg){suffix}: ").strip()
-        if raw.lower() in ("q", "quit", "exit"):
-            raise UserExit()
-        if not raw:
-            if default is not None:
-                return float(default)
-            print("Please enter a value.")
-            continue
-        try:
-            return parse_dose_input(raw, label)
-        except ValueError as exc:
-            print(exc)
-
-
-def prompt_target_volume(default_ml: Optional[float]) -> float:
-    suffix = ""
-    if default_ml is not None:
-        suffix = f" [{fmt_num(default_ml)}mL ({fmt_num(default_ml * 100)}u)]"
-    while True:
-        raw = input(f"Target volume per dose (mL or units){suffix}: ").strip()
-        if raw.lower() in ("q", "quit", "exit"):
-            raise UserExit()
-        if not raw:
-            if default_ml is not None:
-                return float(default_ml)
-            print("Please enter a value.")
-            continue
-        try:
-            value_ml, kind = parse_volume_or_units_input(raw, "target volume")
-        except ValueError as exc:
-            print(exc)
-            continue
-        if kind == "none" and value_ml > 1:
-            value_ml = value_ml / 100.0
-        return value_ml
-
-
-def prompt_yes_no(label: str, default: bool = False) -> bool:
-    suffix = " [Y/n]" if default else " [y/N]"
-    while True:
-        raw = input(f"{label}{suffix}: ").strip().lower()
-        if raw in ("q", "quit", "exit"):
-            raise UserExit()
-        if not raw:
-            return default
-        if raw in ("y", "yes"):
-            return True
-        if raw in ("n", "no"):
-            return False
-        print("Please enter y or n.")
-
-
-def select_peptide(peptides: dict) -> Optional[dict]:
-    if not peptides:
-        return None
-    entries = sorted(peptides.values(), key=lambda item: item.get("name", "").lower())
-    print("Saved peptides:")
-    for idx, entry in enumerate(entries, start=1):
-        print(
-            f"{idx}) {entry['name']} "
-            f"(peptide: {fmt_num(entry['vial_mg'])}mg, "
-            f"BAC: {fmt_num(entry['recon_ml'])}mL, "
-            f"vial size: {fmt_num(get_vial_size_ml(entry))}mL, "
-            f"dose: {fmt_dose_with_units(entry)})"
-        )
-    print("0) New peptide")
-    while True:
-        raw = input("Select peptide [0]: ").strip()
-        if raw.lower() in ("q", "quit", "exit"):
-            raise UserExit()
-        if not raw:
-            return None
-        if raw.isdigit():
-            choice = int(raw)
-            if choice == 0:
-                return None
-            if 1 <= choice <= len(entries):
-                return entries[choice - 1]
-        match = peptides.get(normalize_name(raw))
-        if match:
-            return match
-        print("Invalid choice.")
+# ── Legacy JSON (kept for migration only) ───────────────────────────────────
 
 
 def load_config() -> dict:
@@ -367,44 +1248,7 @@ def load_config() -> dict:
     return data
 
 
-def save_config(data: dict) -> None:
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    try:
-        CONFIG_PATH.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
-    except PermissionError as exc:
-        raise RuntimeError(f"Unable to write config file: {CONFIG_PATH}") from exc
-
-
-def calculate(vial_mg: float, recon_ml: float, dose_mcg: float) -> dict:
-    concentration_mg_ml = vial_mg / recon_ml
-    concentration_mcg_ml = concentration_mg_ml * 1000.0
-    units = (dose_mcg / concentration_mcg_ml) * 100.0
-    return {
-        "concentration_mg_ml": concentration_mg_ml,
-        "concentration_mcg_ml": concentration_mcg_ml,
-        "units": units,
-    }
-
-
-def format_output(
-    name: str,
-    vial_mg: float,
-    recon_ml: float,
-    dose_mcg: float,
-    vial_size_ml: Optional[float] = None,
-) -> str:
-    result = calculate(vial_mg, recon_ml, dose_mcg)
-    line1 = f"{name} (peptide: {fmt_num(vial_mg)}mg, BAC: {fmt_num(recon_ml)}mL"
-    if vial_size_ml:
-        line1 += f", vial size: {fmt_num(vial_size_ml)}mL"
-    line1 += ")"
-    line2 = (
-        "Concentration: "
-        f"{fmt_num(result['concentration_mg_ml'])}mg/mL "
-        f"({fmt_num(result['concentration_mcg_ml'])}mcg/mL)"
-    )
-    line3 = f"Dose: {fmt_dose(dose_mcg)} = {fmt_num(result['units'])} units"
-    return "\n".join([line1, line2, line3])
+# ── Handlers: existing commands (now backed by SQLite) ───────────────────────
 
 
 def handle_calc(args: argparse.Namespace) -> int:
@@ -432,38 +1276,21 @@ def handle_save(args: argparse.Namespace) -> int:
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
-    try:
-        data = load_config()
-    except RuntimeError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        return 1
-    data["peptides"][normalize_name(args.peptide)] = {
-        "name": args.peptide,
-        "vial_mg": vial_mg,
-        "recon_ml": recon_ml,
-        "vial_size_ml": vial_size_ml,
-        "dose_mcg": dose_mcg,
-    }
-    try:
-        save_config(data)
-    except RuntimeError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        return 1
+    conn = get_db()
+    db_save_peptide(conn, args.peptide, vial_mg, recon_ml, dose_mcg, vial_size_ml)
+    conn.close()
     print(f"Saved {args.peptide}.")
     return 0
 
 
 def handle_list(_: argparse.Namespace) -> int:
-    try:
-        data = load_config()
-    except RuntimeError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        return 1
-    peptides = data.get("peptides", {})
-    if not peptides:
+    conn = get_db()
+    entries = db_list_peptides(conn)
+    conn.close()
+    if not entries:
         print("No saved peptides.")
         return 0
-    for entry in sorted(peptides.values(), key=lambda item: item.get("name", "").lower()):
+    for entry in entries:
         print(
             f"{entry['name']} "
             f"(peptide: {fmt_num(entry['vial_mg'])}mg, "
@@ -471,17 +1298,15 @@ def handle_list(_: argparse.Namespace) -> int:
             f"vial size: {fmt_num(get_vial_size_ml(entry))}mL, "
             f"dose: {fmt_dose_with_units(entry)})"
         )
+        if entry["notes"]:
+            print(f"  {entry['notes']}")
     return 0
 
 
 def handle_dose(args: argparse.Namespace) -> int:
-    try:
-        data = load_config()
-    except RuntimeError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        return 1
-    peptides = data.get("peptides", {})
-    entry = peptides.get(normalize_name(args.peptide))
+    conn = get_db()
+    entry = db_get_peptide(conn, args.peptide)
+    conn.close()
     if not entry:
         print(f"Error: '{args.peptide}' not found. Use `pepcalc list`.", file=sys.stderr)
         return 1
@@ -491,36 +1316,41 @@ def handle_dose(args: argparse.Namespace) -> int:
             entry["vial_mg"],
             entry["recon_ml"],
             entry["dose_mcg"],
-            entry.get("vial_size_ml"),
+            entry["vial_size_ml"],
         )
     )
+    if entry["notes"]:
+        print(f"Notes: {entry['notes']}")
     return 0
 
 
 def handle_edit(args: argparse.Namespace) -> int:
-    try:
-        data = load_config()
-    except RuntimeError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        return 1
-    peptides = data.get("peptides", {})
-    if not peptides:
+    conn = get_db()
+    entries = db_list_peptides(conn)
+    if not entries:
+        conn.close()
         print("No saved peptides.")
         return 0
 
     entry = None
     if args.peptide:
-        entry = peptides.get(normalize_name(args.peptide))
+        entry = db_get_peptide(conn, args.peptide)
         if not entry:
+            conn.close()
             print(f"Error: '{args.peptide}' not found. Use `pepcalc list`.", file=sys.stderr)
             return 1
     else:
-        entry = select_peptide(peptides)
+        entry = select_peptide_db(conn)
         if entry is None:
             print("No peptide selected.")
+            conn.close()
             return 0
 
-    original_key = normalize_name(entry["name"])
+    if not check_course_warnings(conn, entry["id"], entry["name"], interactive=True):
+        conn.close()
+        return 0
+
+    original_key = entry["key"]
     print(
         f"Editing {entry['name']} "
         f"(peptide: {fmt_num(entry['vial_mg'])}mg, "
@@ -533,69 +1363,1078 @@ def handle_edit(args: argparse.Namespace) -> int:
     print_mix_summary(data_inputs)
 
     new_key = normalize_name(data_inputs["name"])
-    if new_key != original_key and new_key in peptides:
-        if not prompt_yes_no(f"Overwrite existing '{peptides[new_key]['name']}'", default=False):
-            print("Edit cancelled.")
-            return 0
-
     if new_key != original_key:
-        peptides.pop(original_key, None)
+        existing = db_get_peptide(conn, data_inputs["name"])
+        if existing:
+            if not prompt_yes_no(f"Overwrite existing '{existing['name']}'", default=False):
+                print("Edit cancelled.")
+                conn.close()
+                return 0
 
-    peptides[new_key] = {
-        "name": data_inputs["name"],
-        "vial_mg": data_inputs["vial_mg"],
-        "recon_ml": data_inputs["recon_ml"],
-        "vial_size_ml": data_inputs["vial_size_ml"],
-        "dose_mcg": data_inputs["dose_mcg"],
-    }
     if prompt_yes_no("Save changes", default=True):
-        try:
-            save_config(data)
-        except RuntimeError as exc:
-            print(f"Error: {exc}", file=sys.stderr)
-            return 1
+        if new_key != original_key:
+            db_delete_peptide(conn, original_key)
+        db_save_peptide(
+            conn,
+            data_inputs["name"],
+            data_inputs["vial_mg"],
+            data_inputs["recon_ml"],
+            data_inputs["dose_mcg"],
+            data_inputs["vial_size_ml"],
+        )
         print(f"Updated {data_inputs['name']}.")
     else:
         print("Edit cancelled.")
+    conn.close()
     return 0
 
 
 def handle_mix(_: argparse.Namespace) -> int:
-    try:
-        data = load_config()
-    except RuntimeError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        return 1
-    peptides = data.get("peptides", {})
-    entry = select_peptide(peptides)
+    conn = get_db()
+    entry = select_peptide_db(conn)
+    if entry and not check_course_warnings(conn, entry["id"], entry["name"], interactive=True):
+        conn.close()
+        return 0
     data_inputs = gather_mix_inputs(entry)
     print_mix_summary(data_inputs)
 
     if prompt_yes_no("Save this peptide config", default=False):
-        data["peptides"][normalize_name(data_inputs["name"])] = {
-            "name": data_inputs["name"],
-            "vial_mg": data_inputs["vial_mg"],
-            "recon_ml": data_inputs["recon_ml"],
-            "vial_size_ml": data_inputs["vial_size_ml"],
-            "dose_mcg": data_inputs["dose_mcg"],
-        }
-        try:
-            save_config(data)
-        except RuntimeError as exc:
-            print(f"Error: {exc}", file=sys.stderr)
-            return 1
+        db_save_peptide(
+            conn,
+            data_inputs["name"],
+            data_inputs["vial_mg"],
+            data_inputs["recon_ml"],
+            data_inputs["dose_mcg"],
+            data_inputs["vial_size_ml"],
+        )
         print(f"Saved {data_inputs['name']}.")
+    conn.close()
     return 0
+
+
+# ── Handlers: syringe commands ───────────────────────────────────────────────
+
+
+def handle_syringe_list(_: argparse.Namespace) -> int:
+    conn = get_db()
+    syringes = db_list_syringes(conn)
+    conn.close()
+    if not syringes:
+        print("No saved syringes.")
+        return 0
+    for s in syringes:
+        desc = fmt_syringe(s)
+        extra = []
+        if s["brand"]:
+            extra.append(f"brand: {s['brand']}")
+        if s["description"]:
+            extra.append(s["description"])
+        if extra:
+            desc += f"  ({', '.join(extra)})"
+        print(desc)
+    return 0
+
+
+def handle_syringe_add(_: argparse.Namespace) -> int:
+    name = prompt_text("Syringe name (e.g. Easy Touch 31g 0.3cc)", required=True)
+    brand = prompt_text("Brand", required=False) or None
+    gauge = prompt_optional_int("Gauge (e.g. 31)")
+    capacity_cc = prompt_positive_float("Capacity (cc)", default=0.3)
+    needle_length = prompt_text("Needle length (e.g. 5/16\")", required=False) or None
+    description = prompt_text("Description (full ordering info)", required=False) or None
+    conn = get_db()
+    db_add_syringe(conn, name, brand, gauge, capacity_cc, needle_length, description)
+    conn.close()
+    print(f"Saved syringe: {name}")
+    return 0
+
+
+def handle_syringe_edit(_: argparse.Namespace) -> int:
+    conn = get_db()
+    syringes = db_list_syringes(conn)
+    if not syringes:
+        conn.close()
+        print("No saved syringes.")
+        return 0
+    idx = prompt_choice("Select syringe to edit", syringes, display_fn=fmt_syringe)
+    if idx is None:
+        conn.close()
+        return 0
+    s = syringes[idx]
+    print(f"Editing: {fmt_syringe(s)}")
+    name = prompt_text("Syringe name", default=s["name"], required=True)
+    brand = prompt_text("Brand", default=s["brand"] or "") or None
+    gauge = prompt_optional_int("Gauge", default=s["gauge"])
+    capacity_cc = prompt_positive_float("Capacity (cc)", default=s["capacity_cc"])
+    needle_length = prompt_text("Needle length", default=s["needle_length"] or "") or None
+    description = prompt_text("Description", default=s["description"] or "") or None
+    db_update_syringe(conn, s["id"], name, brand, gauge, capacity_cc, needle_length, description)
+    conn.close()
+    print(f"Updated syringe: {name}")
+    return 0
+
+
+def handle_syringe_remove(_: argparse.Namespace) -> int:
+    conn = get_db()
+    syringes = db_list_syringes(conn)
+    if not syringes:
+        conn.close()
+        print("No saved syringes.")
+        return 0
+    idx = prompt_choice("Select syringe to remove", syringes, display_fn=fmt_syringe)
+    if idx is None:
+        conn.close()
+        return 0
+    s = syringes[idx]
+    if prompt_yes_no(f"Remove '{s['name']}'", default=False):
+        db_delete_syringe(conn, s["id"])
+        print(f"Removed {s['name']}.")
+    else:
+        print("Cancelled.")
+    conn.close()
+    return 0
+
+
+# ── Handlers: protocol commands ──────────────────────────────────────────────
+
+
+def handle_protocol(_: argparse.Namespace) -> int:
+    conn = get_db()
+    entries = db_list_protocol(conn)
+    if not entries:
+        conn.close()
+        print("No protocol entries. Use `pepcalc protocol add` to create one.")
+        return 0
+    for e in entries:
+        days = db_get_protocol_days(conn, e["id"])
+        time_tag = "(M)" if e["time_of_day"] == "morning" else "(N)"
+        syringe_str = f"  Syringe: {e['syringe_name']}" if e["syringe_name"] else ""
+        result = calculate(e["vial_mg"], e["recon_ml"], e["dose_mcg"])
+        print(
+            f"{e['peptide_name']} {time_tag}  "
+            f"{fmt_dose(e['dose_mcg'])} = {fmt_num(result['units'])}u  "
+            f"{format_days(days)}{syringe_str}"
+        )
+    conn.close()
+    return 0
+
+
+def handle_protocol_add(_: argparse.Namespace) -> int:
+    conn = get_db()
+    peptides = db_list_peptides(conn)
+    if not peptides:
+        conn.close()
+        print("No saved peptides. Use `pepcalc save` first.")
+        return 1
+    print("Select peptide for protocol:")
+    idx = prompt_choice(
+        "Peptide",
+        peptides,
+        display_fn=lambda p: f"{p['name']} ({fmt_dose(p['dose_mcg'])})",
+    )
+    if idx is None:
+        conn.close()
+        return 0
+    peptide = peptides[idx]
+    if not check_course_warnings(conn, peptide["id"], peptide["name"], interactive=True):
+        conn.close()
+        return 0
+    # Check if already in protocol
+    existing = conn.execute(
+        "SELECT id FROM protocol_entries WHERE peptide_id = ?", (peptide["id"],)
+    ).fetchone()
+    if existing:
+        print(f"{peptide['name']} is already in the protocol. Use `pepcalc protocol edit`.")
+        conn.close()
+        return 1
+    days = prompt_days()
+    time_of_day = prompt_time_of_day()
+    syringe = select_syringe(conn)
+    syringe_id = syringe["id"] if syringe else None
+    db_add_protocol_entry(conn, peptide["id"], syringe_id, time_of_day, days)
+    conn.close()
+    print(f"Added {peptide['name']} to protocol ({format_days(days)}, {time_of_day}).")
+    return 0
+
+
+def handle_protocol_edit(_: argparse.Namespace) -> int:
+    conn = get_db()
+    entries = db_list_protocol(conn)
+    if not entries:
+        conn.close()
+        print("No protocol entries.")
+        return 0
+
+    def display_entry(e):
+        days = db_get_protocol_days(conn, e["id"])
+        return f"{e['peptide_name']} ({e['time_of_day']}, {format_days(days)})"
+
+    idx = prompt_choice("Select entry to edit", entries, display_fn=display_entry)
+    if idx is None:
+        conn.close()
+        return 0
+    e = entries[idx]
+    if not check_course_warnings(conn, e["peptide_id"], e["peptide_name"], interactive=True):
+        conn.close()
+        return 0
+    current_days = db_get_protocol_days(conn, e["id"])
+    print(f"Editing protocol for {e['peptide_name']}")
+    days = prompt_days(default=current_days)
+    time_of_day = prompt_time_of_day(default=e["time_of_day"])
+    syringe = select_syringe(conn)
+    syringe_id = syringe["id"] if syringe else e["syringe_id"]
+    db_update_protocol_entry(conn, e["id"], syringe_id, time_of_day, days)
+    conn.close()
+    print(f"Updated protocol for {e['peptide_name']}.")
+    return 0
+
+
+def handle_protocol_remove(_: argparse.Namespace) -> int:
+    conn = get_db()
+    entries = db_list_protocol(conn)
+    if not entries:
+        conn.close()
+        print("No protocol entries.")
+        return 0
+
+    def display_entry(e):
+        days = db_get_protocol_days(conn, e["id"])
+        return f"{e['peptide_name']} ({e['time_of_day']}, {format_days(days)})"
+
+    idx = prompt_choice("Select entry to remove", entries, display_fn=display_entry)
+    if idx is None:
+        conn.close()
+        return 0
+    e = entries[idx]
+    if prompt_yes_no(f"Remove {e['peptide_name']} from protocol", default=False):
+        db_delete_protocol_entry(conn, e["id"])
+        print(f"Removed {e['peptide_name']} from protocol.")
+    else:
+        print("Cancelled.")
+    conn.close()
+    return 0
+
+
+# ── Handlers: schedule commands ──────────────────────────────────────────────
+
+
+def handle_schedule(args: argparse.Namespace) -> int:
+    conn = get_db()
+
+    today = datetime.date.today()
+    day_of_week = today.weekday()
+    day_name = DAY_NAMES[day_of_week]
+
+    time_filter = getattr(args, "time_filter", None)
+    show_all = time_filter == "all"
+    if show_all:
+        time_filter = None
+    elif not time_filter:
+        now = datetime.datetime.now()
+        if now.hour < 12:
+            time_filter = "morning"
+        else:
+            time_filter = "night"
+
+    entries = db_get_schedule_for_day(conn, day_of_week, time_filter)
+
+    if not entries:
+        conn.close()
+        if show_all:
+            print(f"No protocol entries for {day_name}.")
+        else:
+            print(f"No {time_filter} protocol entries for {day_name}.")
+        return 0
+
+    if show_all:
+        header = f"Today's Protocol ({day_name})"
+    elif time_filter == "morning":
+        header = f"This Morning's Protocol ({day_name})"
+    else:
+        header = f"Tonight's Protocol ({day_name})"
+    print(header)
+    print("\u2500" * 40)
+
+    for e in entries:
+        result = calculate(e["vial_mg"], e["recon_ml"], e["dose_mcg"])
+        print(e["peptide_name"])
+        print(f"  Dose: {fmt_dose(e['dose_mcg'])} \u2192 {fmt_num(result['units'])} units")
+        if e["syringe_name"]:
+            print(f"  Syringe: {e['syringe_name']}")
+        if e["peptide_notes"]:
+            print(f"  Note: {e['peptide_notes']}")
+        print()
+
+    conn.close()
+    return 0
+
+
+def handle_schedule_tomorrow(args: argparse.Namespace) -> int:
+    conn = get_db()
+
+    tomorrow = datetime.date.today() + datetime.timedelta(days=1)
+    day_of_week = tomorrow.weekday()
+    day_name = DAY_NAMES[day_of_week]
+
+    time_filter = getattr(args, "time_filter", None)
+    if time_filter == "all":
+        time_filter = None
+
+    entries_morning = db_get_schedule_for_day(conn, day_of_week, "morning") if not time_filter or time_filter == "morning" else []
+    entries_night = db_get_schedule_for_day(conn, day_of_week, "night") if not time_filter or time_filter == "night" else []
+
+    if not entries_morning and not entries_night:
+        conn.close()
+        print(f"No protocol entries for tomorrow ({day_name}).")
+        return 0
+
+    print(f"Tomorrow's Protocol ({day_name})")
+    print("\u2500" * 40)
+
+    if entries_morning:
+        print("Morning:")
+        for e in entries_morning:
+            result = calculate(e["vial_mg"], e["recon_ml"], e["dose_mcg"])
+            print(f"  {e['peptide_name']}: {fmt_dose(e['dose_mcg'])} \u2192 {fmt_num(result['units'])} units")
+            if e["syringe_name"]:
+                print(f"    Syringe: {e['syringe_name']}")
+
+    if entries_night:
+        print("Night:")
+        for e in entries_night:
+            result = calculate(e["vial_mg"], e["recon_ml"], e["dose_mcg"])
+            print(f"  {e['peptide_name']}: {fmt_dose(e['dose_mcg'])} \u2192 {fmt_num(result['units'])} units")
+            if e["syringe_name"]:
+                print(f"    Syringe: {e['syringe_name']}")
+
+    conn.close()
+    return 0
+
+
+def handle_schedule_week(_: argparse.Namespace) -> int:
+    conn = get_db()
+    entries = db_list_protocol(conn)
+    if not entries:
+        conn.close()
+        print("No protocol entries. Use `pepcalc protocol add` to create one.")
+        return 0
+
+    # Build grid data
+    today = datetime.date.today()
+    today_weekday = today.weekday()
+    rows = []
+    for e in entries:
+        days = db_get_protocol_days(conn, e["id"])
+        time_tag = "(M)" if e["time_of_day"] == "morning" else "(N)"
+        course = db_get_course(conn, e["peptide_id"])
+        row = {
+            "name": e["peptide_name"],
+            "time_tag": time_tag,
+            "days": set(days),
+            "course": course,
+            "end_suffix": "",
+        }
+        # Compute day numbers and end info for active courses
+        if course and course["active_start"]:
+            start = datetime.date.fromisoformat(course["active_start"])
+            today_day_num = (today - start).days + 1
+            target = course["target_duration"] or course["duration_min"]
+            end_date = start + datetime.timedelta(days=target - 1)
+            row["end_suffix"] = f"  \u2192 end day {target} (~{end_date.strftime('%b %-d')})"
+            # Compute day number for each weekday (Mon=0..Sun=6) relative to today
+            day_nums = {}
+            for d in range(7):
+                offset = d - today_weekday
+                day_nums[d] = today_day_num + offset
+            row["day_nums"] = day_nums
+        else:
+            row["day_nums"] = None
+        rows.append(row)
+
+    # Calculate column widths
+    max_name = max(len(r["name"]) for r in rows)
+    name_col = max(max_name + 6, 14)  # +6 for " (N) "
+
+    print("Weekly Protocol")
+    sep = "\u2500" * (name_col + 5 * 7 + 2)
+    print(sep)
+    header = " " * name_col + "".join(f"{d:>5}" for d in DAY_NAMES)
+    print(header)
+
+    for r in rows:
+        label = f"{r['name']}  {r['time_tag']}"
+        line = f"{label:<{name_col}}"
+        for d in range(7):
+            if d not in r["days"]:
+                line += "   - "
+            elif r["day_nums"] is not None and r["day_nums"][d] >= 1:
+                line += f"{r['day_nums'][d]:>4} "
+            else:
+                line += "   * "
+        line += r["end_suffix"]
+        print(line)
+
+    print(sep)
+    print("(N) = night, (M) = morning")
+
+    # Today's detail card
+    day_name = DAY_NAMES[today_weekday]
+    today_entries = db_get_schedule_for_day(conn, today_weekday)
+    if today_entries:
+        print()
+        print(f"Today ({day_name})")
+        print("\u2500" * 40)
+        for e in today_entries:
+            result = calculate(e["vial_mg"], e["recon_ml"], e["dose_mcg"])
+            time_tag = "(M)" if e["time_of_day"] == "morning" else "(N)"
+            print(f"  {e['peptide_name']} {time_tag}: {fmt_dose(e['dose_mcg'])} \u2192 {fmt_num(result['units'])} units")
+            if e["syringe_name"]:
+                print(f"    Syringe: {e['syringe_name']}")
+            if e["peptide_notes"]:
+                print(f"    Note: {e['peptide_notes']}")
+            print()
+
+        # Course status lines for today's peptides
+        seen_peptides = set()
+        for e in today_entries:
+            if e["peptide_id"] in seen_peptides:
+                continue
+            seen_peptides.add(e["peptide_id"])
+            status = get_course_status(conn, e["peptide_id"])
+            if not status:
+                continue
+            course = status["course"]
+            dur = f"{course['duration_min']}"
+            if course["duration_max"]:
+                dur += f"-{course['duration_max']}"
+            if status["active"]:
+                if status["past_max"]:
+                    print(f"  \u26a0 {e['peptide_name']}: Day {status['day_number']} of {dur} day course \u2014 past max duration")
+                elif status["past_min"]:
+                    print(f"  \u26a0 {e['peptide_name']}: Day {status['day_number']} of {dur} day course \u2014 consider ending soon")
+            else:
+                msg = f"  \u2139 {e['peptide_name']}: Off-cycle"
+                if status["next_due_date"]:
+                    msg += f" (next course due ~{status['next_due_date'].strftime('%b %-d')})"
+                print(msg)
+
+    conn.close()
+    return 0
+
+
+# ── Handlers: supply commands ────────────────────────────────────────────────
+
+
+def handle_supply_list(_: argparse.Namespace) -> int:
+    conn = get_db()
+    supplies = db_list_supplies(conn)
+    conn.close()
+    if not supplies:
+        print("No saved supplies.")
+        return 0
+    for s in supplies:
+        parts = [s["name"]]
+        if s["category"]:
+            parts.append(f"[{s['category']}]")
+        if s["description"]:
+            parts.append(f"- {s['description']}")
+        print(" ".join(parts))
+    return 0
+
+
+def handle_supply_add(_: argparse.Namespace) -> int:
+    name = prompt_text("Supply name", required=True)
+    category = prompt_text("Category (e.g. sharps, alcohol pads, bac water)", required=False) or None
+    description = prompt_text("Description", required=False) or None
+    conn = get_db()
+    db_add_supply(conn, name, category, description)
+    conn.close()
+    print(f"Saved supply: {name}")
+    return 0
+
+
+def handle_supply_edit(_: argparse.Namespace) -> int:
+    conn = get_db()
+    supplies = db_list_supplies(conn)
+    if not supplies:
+        conn.close()
+        print("No saved supplies.")
+        return 0
+    idx = prompt_choice(
+        "Select supply to edit",
+        supplies,
+        display_fn=lambda s: f"{s['name']}" + (f" [{s['category']}]" if s["category"] else ""),
+    )
+    if idx is None:
+        conn.close()
+        return 0
+    s = supplies[idx]
+    print(f"Editing: {s['name']}")
+    name = prompt_text("Supply name", default=s["name"], required=True)
+    category = prompt_text("Category", default=s["category"] or "") or None
+    description = prompt_text("Description", default=s["description"] or "") or None
+    db_update_supply(conn, s["id"], name, category, description)
+    conn.close()
+    print(f"Updated supply: {name}")
+    return 0
+
+
+def handle_supply_remove(_: argparse.Namespace) -> int:
+    conn = get_db()
+    supplies = db_list_supplies(conn)
+    if not supplies:
+        conn.close()
+        print("No saved supplies.")
+        return 0
+    idx = prompt_choice(
+        "Select supply to remove",
+        supplies,
+        display_fn=lambda s: f"{s['name']}" + (f" [{s['category']}]" if s["category"] else ""),
+    )
+    if idx is None:
+        conn.close()
+        return 0
+    s = supplies[idx]
+    if prompt_yes_no(f"Remove '{s['name']}'", default=False):
+        db_delete_supply(conn, s["id"])
+        print(f"Removed {s['name']}.")
+    else:
+        print("Cancelled.")
+    conn.close()
+    return 0
+
+
+# ── Handlers: supplier commands ──────────────────────────────────────────────
+
+
+def handle_supplier_list(_: argparse.Namespace) -> int:
+    conn = get_db()
+    suppliers = db_list_suppliers(conn)
+    if not suppliers:
+        conn.close()
+        print("No saved suppliers.")
+        return 0
+    for sup in suppliers:
+        url_str = f"  ({sup['url']})" if sup["url"] else ""
+        print(f"{sup['name']}{url_str}")
+        items = db_list_supplier_items(conn, sup["id"])
+        for item in items:
+            item_name = _resolve_item_name(conn, item["item_type"], item["item_id"])
+            price_str = f"${fmt_num(item['price'])}" if item["price"] is not None else "no price"
+            notes_str = f" - {item['notes']}" if item["notes"] else ""
+            print(f"  [{item['item_type']}] {item_name}: {price_str}{notes_str}")
+    conn.close()
+    return 0
+
+
+def _resolve_item_name(conn: sqlite3.Connection, item_type: str, item_id: int) -> str:
+    if item_type == "peptide":
+        row = db_get_peptide_by_id(conn, item_id)
+        return row["name"] if row else f"(deleted peptide #{item_id})"
+    elif item_type == "syringe":
+        row = db_get_syringe(conn, item_id)
+        return row["name"] if row else f"(deleted syringe #{item_id})"
+    elif item_type == "supply":
+        row = db_get_supply(conn, item_id)
+        return row["name"] if row else f"(deleted supply #{item_id})"
+    return f"(unknown {item_type} #{item_id})"
+
+
+def handle_supplier_add(_: argparse.Namespace) -> int:
+    name = prompt_text("Supplier name", required=True)
+    url = prompt_text("URL", required=False) or None
+    conn = get_db()
+    db_add_supplier(conn, name, url)
+    conn.close()
+    print(f"Saved supplier: {name}")
+    return 0
+
+
+def handle_supplier_edit(_: argparse.Namespace) -> int:
+    conn = get_db()
+    suppliers = db_list_suppliers(conn)
+    if not suppliers:
+        conn.close()
+        print("No saved suppliers.")
+        return 0
+    idx = prompt_choice(
+        "Select supplier to edit",
+        suppliers,
+        display_fn=lambda s: f"{s['name']}" + (f" ({s['url']})" if s["url"] else ""),
+    )
+    if idx is None:
+        conn.close()
+        return 0
+    sup = suppliers[idx]
+    print(f"Editing: {sup['name']}")
+    name = prompt_text("Supplier name", default=sup["name"], required=True)
+    url = prompt_text("URL", default=sup["url"] or "") or None
+    db_update_supplier(conn, sup["id"], name, url)
+    conn.close()
+    print(f"Updated supplier: {name}")
+    return 0
+
+
+def handle_supplier_remove(_: argparse.Namespace) -> int:
+    conn = get_db()
+    suppliers = db_list_suppliers(conn)
+    if not suppliers:
+        conn.close()
+        print("No saved suppliers.")
+        return 0
+    idx = prompt_choice(
+        "Select supplier to remove",
+        suppliers,
+        display_fn=lambda s: f"{s['name']}" + (f" ({s['url']})" if s["url"] else ""),
+    )
+    if idx is None:
+        conn.close()
+        return 0
+    sup = suppliers[idx]
+    if prompt_yes_no(f"Remove '{sup['name']}' and all linked items", default=False):
+        db_delete_supplier(conn, sup["id"])
+        print(f"Removed {sup['name']}.")
+    else:
+        print("Cancelled.")
+    conn.close()
+    return 0
+
+
+def handle_supplier_link(_: argparse.Namespace) -> int:
+    conn = get_db()
+    suppliers = db_list_suppliers(conn)
+    if not suppliers:
+        conn.close()
+        print("No saved suppliers. Use `pepcalc supplier add` first.")
+        return 1
+    print("Select supplier:")
+    sup_idx = prompt_choice(
+        "Supplier",
+        suppliers,
+        display_fn=lambda s: s["name"],
+    )
+    if sup_idx is None:
+        conn.close()
+        return 0
+    sup = suppliers[sup_idx]
+
+    print("Item type:")
+    types = [("peptide", "Peptide"), ("syringe", "Syringe"), ("supply", "Supply")]
+    type_idx = prompt_choice("Type", types, display_fn=lambda t: t[1])
+    if type_idx is None:
+        conn.close()
+        return 0
+    item_type = types[type_idx][0]
+
+    if item_type == "peptide":
+        items = db_list_peptides(conn)
+        display = lambda p: p["name"]
+    elif item_type == "syringe":
+        items = db_list_syringes(conn)
+        display = lambda s: fmt_syringe(s)
+    else:
+        items = db_list_supplies(conn)
+        display = lambda s: s["name"]
+
+    if not items:
+        conn.close()
+        print(f"No saved {item_type}s.")
+        return 1
+
+    print(f"Select {item_type}:")
+    item_idx = prompt_choice("Item", items, display_fn=display)
+    if item_idx is None:
+        conn.close()
+        return 0
+    item = items[item_idx]
+
+    price = prompt_optional_float("Price")
+    notes = prompt_text("Notes", required=False) or None
+    db_link_supplier_item(conn, sup["id"], item_type, item["id"], price, notes)
+    conn.close()
+    print(f"Linked {item['name']} to {sup['name']}.")
+    return 0
+
+
+def handle_supplier_unlink(_: argparse.Namespace) -> int:
+    conn = get_db()
+    suppliers = db_list_suppliers(conn)
+    if not suppliers:
+        conn.close()
+        print("No saved suppliers.")
+        return 0
+    print("Select supplier:")
+    sup_idx = prompt_choice(
+        "Supplier",
+        suppliers,
+        display_fn=lambda s: s["name"],
+    )
+    if sup_idx is None:
+        conn.close()
+        return 0
+    sup = suppliers[sup_idx]
+    items = db_list_supplier_items(conn, sup["id"])
+    if not items:
+        conn.close()
+        print(f"No items linked to {sup['name']}.")
+        return 0
+
+    def display_link(item):
+        name = _resolve_item_name(conn, item["item_type"], item["item_id"])
+        price_str = f"${fmt_num(item['price'])}" if item["price"] is not None else "no price"
+        return f"[{item['item_type']}] {name}: {price_str}"
+
+    link_idx = prompt_choice("Select item to unlink", items, display_fn=display_link)
+    if link_idx is None:
+        conn.close()
+        return 0
+    link = items[link_idx]
+    item_name = _resolve_item_name(conn, link["item_type"], link["item_id"])
+    if prompt_yes_no(f"Unlink {item_name} from {sup['name']}", default=False):
+        db_unlink_supplier_item(conn, link["id"])
+        print(f"Unlinked {item_name} from {sup['name']}.")
+    else:
+        print("Cancelled.")
+    conn.close()
+    return 0
+
+
+# ── Handlers: inventory commands ──────────────────────────────────────────────
+
+
+def handle_inventory(_: argparse.Namespace) -> int:
+    conn = get_db()
+    vials = db_list_vials(conn)
+    conn.close()
+    if not vials:
+        print("No vials in inventory. Use `pepcalc inventory add` to add some.")
+        return 0
+    current_peptide = None
+    for v in vials:
+        label = f"{v['peptide_name']} {fmt_num(v['vial_mg'])}mg"
+        if label != current_peptide:
+            if current_peptide is not None:
+                print()
+            print(label)
+            current_peptide = label
+        if v["state"] == "reconstituted" and v["reconstituted_date"]:
+            try:
+                dt = datetime.datetime.strptime(v["reconstituted_date"], "%Y-%m-%d")
+                date_str = dt.strftime("%b %-d")
+            except ValueError:
+                date_str = v["reconstituted_date"]
+            state_str = f"reconstituted (mixed {date_str})"
+        else:
+            state_str = v["state"]
+        notes_str = f"  - {v['notes']}" if v["notes"] else ""
+        print(f"  1 {state_str}{notes_str}")
+    return 0
+
+
+def handle_inventory_add(_: argparse.Namespace) -> int:
+    conn = get_db()
+    peptides = db_list_peptides(conn)
+    if not peptides:
+        conn.close()
+        print("No saved peptides. Use `pepcalc save` first.")
+        return 1
+    print("Select peptide:")
+    idx = prompt_choice(
+        "Peptide",
+        peptides,
+        display_fn=lambda p: f"{p['name']} ({fmt_num(p['vial_mg'])}mg)",
+    )
+    if idx is None:
+        conn.close()
+        return 0
+    peptide = peptides[idx]
+    count = prompt_optional_int("How many vials", default=1) or 1
+    print("State:")
+    states = [("lyophilized", "Lyophilized (powder)"), ("reconstituted", "Reconstituted (mixed)")]
+    state_idx = prompt_choice("State", states, display_fn=lambda s: s[1])
+    state = states[state_idx][0] if state_idx is not None else "lyophilized"
+    recon_date = None
+    if state == "reconstituted":
+        date_str = prompt_text("Reconstituted date (YYYY-MM-DD)", default=datetime.date.today().isoformat())
+        recon_date = date_str
+    notes = prompt_text("Notes", required=False) or None
+    for _ in range(count):
+        db_add_vial(conn, peptide["id"], state, recon_date, notes)
+    conn.close()
+    label = "vial" if count == 1 else "vials"
+    print(f"Added {count} {state} {label} of {peptide['name']}.")
+    return 0
+
+
+def handle_inventory_mix(_: argparse.Namespace) -> int:
+    conn = get_db()
+    lyoph = conn.execute(
+        "SELECT v.*, p.name AS peptide_name, p.vial_mg "
+        "FROM vials v JOIN peptides p ON v.peptide_id = p.id "
+        "WHERE v.state = 'lyophilized' "
+        "ORDER BY p.name COLLATE NOCASE, v.id"
+    ).fetchall()
+    if not lyoph:
+        conn.close()
+        print("No lyophilized vials to reconstitute.")
+        return 0
+    print("Select vial to reconstitute:")
+    idx = prompt_choice(
+        "Vial",
+        lyoph,
+        display_fn=lambda v: f"{v['peptide_name']} {fmt_num(v['vial_mg'])}mg (lyophilized)"
+                              + (f"  - {v['notes']}" if v["notes"] else ""),
+    )
+    if idx is None:
+        conn.close()
+        return 0
+    vial = lyoph[idx]
+    date_str = prompt_text("Reconstituted date (YYYY-MM-DD)", default=datetime.date.today().isoformat())
+    db_update_vial_state(conn, vial["id"], "reconstituted", date_str)
+    conn.close()
+    print(f"Marked {vial['peptide_name']} vial as reconstituted ({date_str}).")
+    return 0
+
+
+def handle_inventory_remove(_: argparse.Namespace) -> int:
+    conn = get_db()
+    vials = db_list_vials(conn)
+    if not vials:
+        conn.close()
+        print("No vials in inventory.")
+        return 0
+    print("Select vial to remove:")
+
+    def display_vial(v):
+        state_str = v["state"]
+        if v["state"] == "reconstituted" and v["reconstituted_date"]:
+            state_str = f"reconstituted (mixed {v['reconstituted_date']})"
+        desc = f"{v['peptide_name']} {fmt_num(v['vial_mg'])}mg ({state_str})"
+        if v["notes"]:
+            desc += f"  - {v['notes']}"
+        return desc
+
+    idx = prompt_choice("Vial", vials, display_fn=display_vial)
+    if idx is None:
+        conn.close()
+        return 0
+    vial = vials[idx]
+    if prompt_yes_no(f"Remove {vial['peptide_name']} vial ({vial['state']})", default=False):
+        db_delete_vial(conn, vial["id"])
+        print(f"Removed {vial['peptide_name']} vial.")
+    else:
+        print("Cancelled.")
+    conn.close()
+    return 0
+
+
+# ── Handlers: course commands ──────────────────────────────────────────────
+
+
+def handle_course(_: argparse.Namespace) -> int:
+    conn = get_db()
+    courses = db_list_courses(conn)
+    if not courses:
+        conn.close()
+        print("No course tracking configured. Use `pepcalc course add` to set one up.")
+        return 0
+    today = datetime.date.today()
+    for c in courses:
+        dur = f"{c['duration_min']}"
+        if c["duration_max"]:
+            dur += f"-{c['duration_max']}"
+        if c["active_start"]:
+            start = datetime.date.fromisoformat(c["active_start"])
+            day_num = (today - start).days + 1
+            target = c["target_duration"] or c["duration_min"]
+            end_date = start + datetime.timedelta(days=target - 1)
+            start_str = start.strftime("%b %-d")
+            end_str = end_date.strftime("%b %-d")
+            line = f"{c['peptide_name']} — Day {day_num} of {target} (range {dur}, started {start_str}, end ~{end_str})"
+            if c["duration_max"] and day_num > c["duration_max"]:
+                line += "  ⚠ past max duration"
+            elif day_num > target:
+                line += "  — past target, consider ending"
+        else:
+            line = f"{c['peptide_name']} — Off-cycle"
+            if c["last_completed"] and c["gap_days"]:
+                last = datetime.date.fromisoformat(c["last_completed"])
+                next_due = last + datetime.timedelta(days=c["gap_days"])
+                line += f". Last course ended {last.strftime('%b %-d')}. Next due ~{next_due.strftime('%b %-d')}."
+        print(line)
+    conn.close()
+    return 0
+
+
+def handle_course_add(_: argparse.Namespace) -> int:
+    conn = get_db()
+    peptides = db_list_peptides(conn)
+    if not peptides:
+        conn.close()
+        print("No saved peptides. Use `pepcalc save` first.")
+        return 1
+    # Filter out peptides that already have course tracking
+    existing_ids = {c["peptide_id"] for c in db_list_courses(conn)}
+    available = [p for p in peptides if p["id"] not in existing_ids]
+    if not available:
+        conn.close()
+        print("All peptides already have course tracking configured.")
+        return 0
+    print("Select peptide for course tracking:")
+    idx = prompt_choice(
+        "Peptide",
+        available,
+        display_fn=lambda p: p["name"],
+    )
+    if idx is None:
+        conn.close()
+        return 0
+    peptide = available[idx]
+    duration_min = prompt_optional_int("Minimum course length (days)", default=30) or 30
+    duration_max = prompt_optional_int("Maximum course length (days)")
+    target_duration = prompt_optional_int("Target duration (days)", default=duration_min)
+    gap_days = prompt_optional_int("Recommended gap between courses (days)")
+    notes = prompt_text("Notes", required=False) or None
+    db_add_course(conn, peptide["id"], duration_min, duration_max, target_duration, gap_days, notes)
+    conn.close()
+    dur = f"{duration_min}"
+    if duration_max:
+        dur += f"-{duration_max}"
+    print(f"Added course tracking for {peptide['name']} ({dur} days).")
+    return 0
+
+
+def handle_course_start(_: argparse.Namespace) -> int:
+    conn = get_db()
+    courses = db_list_courses(conn)
+    inactive = [c for c in courses if not c["active_start"]]
+    if not inactive:
+        conn.close()
+        if courses:
+            print("All tracked courses are already active.")
+        else:
+            print("No course tracking configured. Use `pepcalc course add` first.")
+        return 0
+    print("Select course to start:")
+    idx = prompt_choice(
+        "Course",
+        inactive,
+        display_fn=lambda c: c["peptide_name"],
+    )
+    if idx is None:
+        conn.close()
+        return 0
+    course = inactive[idx]
+    date_str = prompt_text("Start date (YYYY-MM-DD)", default=datetime.date.today().isoformat())
+    db_start_course(conn, course["id"], date_str)
+    conn.close()
+    print(f"Started course for {course['peptide_name']} ({date_str}).")
+    return 0
+
+
+def handle_course_stop(_: argparse.Namespace) -> int:
+    conn = get_db()
+    courses = db_list_courses(conn)
+    active = [c for c in courses if c["active_start"]]
+    if not active:
+        conn.close()
+        print("No active courses to stop.")
+        return 0
+    print("Select course to stop:")
+
+    def display_active(c):
+        start = datetime.date.fromisoformat(c["active_start"])
+        day_num = (datetime.date.today() - start).days + 1
+        return f"{c['peptide_name']} (day {day_num})"
+
+    idx = prompt_choice("Course", active, display_fn=display_active)
+    if idx is None:
+        conn.close()
+        return 0
+    course = active[idx]
+    date_str = prompt_text("End date (YYYY-MM-DD)", default=datetime.date.today().isoformat())
+    db_stop_course(conn, course["id"], date_str)
+    conn.close()
+    print(f"Stopped course for {course['peptide_name']} ({date_str}).")
+    return 0
+
+
+def handle_course_edit(_: argparse.Namespace) -> int:
+    conn = get_db()
+    courses = db_list_courses(conn)
+    if not courses:
+        conn.close()
+        print("No course tracking configured.")
+        return 0
+    print("Select course to edit:")
+    idx = prompt_choice(
+        "Course",
+        courses,
+        display_fn=lambda c: c["peptide_name"],
+    )
+    if idx is None:
+        conn.close()
+        return 0
+    c = courses[idx]
+    print(f"Editing course for {c['peptide_name']}")
+    duration_min = prompt_optional_int("Minimum course length (days)", default=c["duration_min"]) or c["duration_min"]
+    duration_max = prompt_optional_int("Maximum course length (days)", default=c["duration_max"])
+    target_default = c["target_duration"] or duration_min
+    target_duration = prompt_optional_int("Target duration (days)", default=target_default)
+    gap_days = prompt_optional_int("Recommended gap between courses (days)", default=c["gap_days"])
+    notes = prompt_text("Notes", default=c["notes"] or "") or None
+    db_update_course(conn, c["id"], duration_min, duration_max, target_duration, gap_days, notes)
+    conn.close()
+    print(f"Updated course tracking for {c['peptide_name']}.")
+    return 0
+
+
+def handle_course_remove(_: argparse.Namespace) -> int:
+    conn = get_db()
+    courses = db_list_courses(conn)
+    if not courses:
+        conn.close()
+        print("No course tracking configured.")
+        return 0
+    print("Select course to remove:")
+    idx = prompt_choice(
+        "Course",
+        courses,
+        display_fn=lambda c: c["peptide_name"],
+    )
+    if idx is None:
+        conn.close()
+        return 0
+    c = courses[idx]
+    if prompt_yes_no(f"Remove course tracking for '{c['peptide_name']}'", default=False):
+        db_delete_course(conn, c["id"])
+        print(f"Removed course tracking for {c['peptide_name']}.")
+    else:
+        print("Cancelled.")
+    conn.close()
+    return 0
+
+
+# ── Parser ───────────────────────────────────────────────────────────────────
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="pepcalc",
-        description="Peptide reconstitution calculator",
+        description="Peptide protocol management and reconstitution calculator",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="Examples:\n  pepcalc calc BPC-157 5 2 250\n  pepcalc mix\n  pepcalc edit",
+        epilog=(
+            "Examples:\n"
+            "  pepcalc calc BPC-157 5 2 250\n"
+            "  pepcalc mix\n"
+            "  pepcalc edit\n"
+            "  pepcalc schedule\n"
+            "  pepcalc protocol add"
+        ),
     )
     subparsers = parser.add_subparsers(dest="command")
+
+    # ── Existing commands ────────────────────────────────────────────────
 
     calc = subparsers.add_parser("calc", help="calculate syringe units per dose")
     calc.add_argument("peptide")
@@ -626,7 +2465,139 @@ def build_parser() -> argparse.ArgumentParser:
     mix = subparsers.add_parser("mix", help="interactive walkthrough for reconstitution volume")
     mix.set_defaults(func=handle_mix)
 
+    # ── Schedule commands ────────────────────────────────────────────────
+
+    schedule = subparsers.add_parser("schedule", help="show today's protocol card")
+    schedule.add_argument("--morning", dest="time_filter", action="store_const", const="morning")
+    schedule.add_argument("--night", dest="time_filter", action="store_const", const="night")
+    schedule.add_argument("--all", dest="time_filter", action="store_const", const="all")
+    schedule_sub = schedule.add_subparsers(dest="schedule_command")
+    schedule.set_defaults(func=handle_schedule_week)
+
+    schedule_week = schedule_sub.add_parser("week", help="weekly overview grid")
+    schedule_week.set_defaults(func=handle_schedule_week)
+
+    schedule_tomorrow = schedule_sub.add_parser("tomorrow", help="tomorrow's protocol card")
+    schedule_tomorrow.add_argument("--morning", dest="time_filter", action="store_const", const="morning")
+    schedule_tomorrow.add_argument("--night", dest="time_filter", action="store_const", const="night")
+    schedule_tomorrow.add_argument("--all", dest="time_filter", action="store_const", const="all")
+    schedule_tomorrow.set_defaults(func=handle_schedule_tomorrow)
+
+    # ── Protocol commands ────────────────────────────────────────────────
+
+    protocol = subparsers.add_parser("protocol", help="manage weekly dosing protocol")
+    protocol_sub = protocol.add_subparsers(dest="protocol_command")
+    protocol.set_defaults(func=handle_protocol)
+
+    protocol_add = protocol_sub.add_parser("add", help="add peptide to protocol")
+    protocol_add.set_defaults(func=handle_protocol_add)
+
+    protocol_edit = protocol_sub.add_parser("edit", help="edit a protocol entry")
+    protocol_edit.set_defaults(func=handle_protocol_edit)
+
+    protocol_remove = protocol_sub.add_parser("remove", help="remove from protocol")
+    protocol_remove.set_defaults(func=handle_protocol_remove)
+
+    # ── Syringe commands ─────────────────────────────────────────────────
+
+    syringe = subparsers.add_parser("syringe", help="manage syringes")
+    syringe_sub = syringe.add_subparsers(dest="syringe_command")
+    syringe.set_defaults(func=lambda _: handle_syringe_list(_))
+
+    syringe_list = syringe_sub.add_parser("list", help="list saved syringes")
+    syringe_list.set_defaults(func=handle_syringe_list)
+
+    syringe_add = syringe_sub.add_parser("add", help="add a syringe")
+    syringe_add.set_defaults(func=handle_syringe_add)
+
+    syringe_edit = syringe_sub.add_parser("edit", help="edit a syringe")
+    syringe_edit.set_defaults(func=handle_syringe_edit)
+
+    syringe_remove = syringe_sub.add_parser("remove", help="remove a syringe")
+    syringe_remove.set_defaults(func=handle_syringe_remove)
+
+    # ── Supply commands ──────────────────────────────────────────────────
+
+    supply = subparsers.add_parser("supply", help="manage supplies")
+    supply_sub = supply.add_subparsers(dest="supply_command")
+    supply.set_defaults(func=lambda _: handle_supply_list(_))
+
+    supply_list = supply_sub.add_parser("list", help="list saved supplies")
+    supply_list.set_defaults(func=handle_supply_list)
+
+    supply_add = supply_sub.add_parser("add", help="add a supply")
+    supply_add.set_defaults(func=handle_supply_add)
+
+    supply_edit = supply_sub.add_parser("edit", help="edit a supply")
+    supply_edit.set_defaults(func=handle_supply_edit)
+
+    supply_remove = supply_sub.add_parser("remove", help="remove a supply")
+    supply_remove.set_defaults(func=handle_supply_remove)
+
+    # ── Inventory commands ───────────────────────────────────────────────
+
+    inventory = subparsers.add_parser("inventory", help="manage vial inventory")
+    inventory_sub = inventory.add_subparsers(dest="inventory_command")
+    inventory.set_defaults(func=handle_inventory)
+
+    inventory_add = inventory_sub.add_parser("add", help="add vials to inventory")
+    inventory_add.set_defaults(func=handle_inventory_add)
+
+    inventory_mix = inventory_sub.add_parser("mix", help="mark a vial as reconstituted")
+    inventory_mix.set_defaults(func=handle_inventory_mix)
+
+    inventory_remove = inventory_sub.add_parser("remove", help="remove a vial from inventory")
+    inventory_remove.set_defaults(func=handle_inventory_remove)
+
+    # ── Supplier commands ────────────────────────────────────────────────
+
+    supplier = subparsers.add_parser("supplier", help="manage suppliers")
+    supplier_sub = supplier.add_subparsers(dest="supplier_command")
+    supplier.set_defaults(func=lambda _: handle_supplier_list(_))
+
+    supplier_list = supplier_sub.add_parser("list", help="list saved suppliers")
+    supplier_list.set_defaults(func=handle_supplier_list)
+
+    supplier_add = supplier_sub.add_parser("add", help="add a supplier")
+    supplier_add.set_defaults(func=handle_supplier_add)
+
+    supplier_edit = supplier_sub.add_parser("edit", help="edit a supplier")
+    supplier_edit.set_defaults(func=handle_supplier_edit)
+
+    supplier_remove = supplier_sub.add_parser("remove", help="remove a supplier")
+    supplier_remove.set_defaults(func=handle_supplier_remove)
+
+    supplier_link = supplier_sub.add_parser("link", help="link supplier to item with price")
+    supplier_link.set_defaults(func=handle_supplier_link)
+
+    supplier_unlink = supplier_sub.add_parser("unlink", help="unlink supplier from item")
+    supplier_unlink.set_defaults(func=handle_supplier_unlink)
+
+    # ── Course commands ─────────────────────────────────────────────────
+
+    course = subparsers.add_parser("course", help="manage course/cycle tracking")
+    course_sub = course.add_subparsers(dest="course_command")
+    course.set_defaults(func=handle_course)
+
+    course_add = course_sub.add_parser("add", help="add course tracking for a peptide")
+    course_add.set_defaults(func=handle_course_add)
+
+    course_start = course_sub.add_parser("start", help="start a new course")
+    course_start.set_defaults(func=handle_course_start)
+
+    course_stop = course_sub.add_parser("stop", help="end the current course")
+    course_stop.set_defaults(func=handle_course_stop)
+
+    course_edit = course_sub.add_parser("edit", help="edit course configuration")
+    course_edit.set_defaults(func=handle_course_edit)
+
+    course_remove = course_sub.add_parser("remove", help="remove course tracking")
+    course_remove.set_defaults(func=handle_course_remove)
+
     return parser
+
+
+# ── Main ─────────────────────────────────────────────────────────────────────
 
 
 def main() -> int:
@@ -634,7 +2605,7 @@ def main() -> int:
     args = parser.parse_args()
     if args.command is None:
         print("Use `pepcalc -h` for help.")
-        print("Examples: pepcalc calc BPC-157 5 2 250 | pepcalc mix | pepcalc edit")
+        print("Examples: pepcalc calc BPC-157 5 2 250 | pepcalc mix | pepcalc schedule")
         return 0
     try:
         return args.func(args)
