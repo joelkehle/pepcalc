@@ -23,5 +23,16 @@ Artifacts:
 powershell -ExecutionPolicy Bypass -File packaging/windows/build.ps1 -Python python
 ```
 
+## Test
+
+From repo root:
+
+```powershell
+py -3 -m unittest discover -s tests -v
+```
+
+The tests use a temporary app data folder and do not touch your saved peptides.
+
 ## Notes
-- Config is stored at `%APPDATA%\pepcalc\peptides.json`.
+- Data is stored at `%APPDATA%\pepcalc\pepcalc.db`.
+- Older `%APPDATA%\pepcalc\peptides.json` data is migrated on first run.

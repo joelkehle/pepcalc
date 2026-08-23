@@ -60,6 +60,11 @@ def fmt_num(value: float, max_dec: int = 2) -> str:
     return text if text else "0"
 
 
+def fmt_short_date(value: datetime.date) -> str:
+    """Format dates like 'Aug 23' on both Windows and Unix."""
+    return f"{value.strftime('%b')} {value.day}"
+
+
 def get_vial_size_ml(entry) -> float:
     if not entry:
         return DEFAULT_VIAL_SIZE_ML
@@ -748,7 +753,7 @@ def check_course_warnings(conn: sqlite3.Connection, peptide_id: int,
     else:
         msg = f"Note: {peptide_name} is off-cycle."
         if status["next_due_date"]:
-            msg += f" Next course due ~{status['next_due_date'].strftime('%b %-d')}."
+            msg += f" Next course due ~{fmt_short_date(status['next_due_date'])}."
         print(msg)
     if interactive and (not status["active"] or status["past_max"]):
         if not prompt_yes_no("Continue", default=True):
@@ -1740,7 +1745,7 @@ def handle_schedule_week(_: argparse.Namespace) -> int:
             today_day_num = (today - start).days + 1
             target = course["target_duration"] or course["duration_min"]
             end_date = start + datetime.timedelta(days=target - 1)
-            row["end_suffix"] = f"  \u2192 end day {target} (~{end_date.strftime('%b %-d')})"
+            row["end_suffix"] = f"  \u2192 end day {target} (~{fmt_short_date(end_date)})"
             # Compute day number for each weekday (Mon=0..Sun=6) relative to today
             day_nums = {}
             for d in range(7):
@@ -1815,7 +1820,7 @@ def handle_schedule_week(_: argparse.Namespace) -> int:
             else:
                 msg = f"  \u2139 {e['peptide_name']}: Off-cycle"
                 if status["next_due_date"]:
-                    msg += f" (next course due ~{status['next_due_date'].strftime('%b %-d')})"
+                    msg += f" (next course due ~{fmt_short_date(status['next_due_date'])})"
                 print(msg)
 
     conn.close()
@@ -2120,7 +2125,7 @@ def handle_inventory(_: argparse.Namespace) -> int:
         if v["state"] == "reconstituted" and v["reconstituted_date"]:
             try:
                 dt = datetime.datetime.strptime(v["reconstituted_date"], "%Y-%m-%d")
-                date_str = dt.strftime("%b %-d")
+                date_str = fmt_short_date(dt)
             except ValueError:
                 date_str = v["reconstituted_date"]
             state_str = f"reconstituted (mixed {date_str})"
@@ -2248,8 +2253,8 @@ def handle_course(_: argparse.Namespace) -> int:
             day_num = (today - start).days + 1
             target = c["target_duration"] or c["duration_min"]
             end_date = start + datetime.timedelta(days=target - 1)
-            start_str = start.strftime("%b %-d")
-            end_str = end_date.strftime("%b %-d")
+            start_str = fmt_short_date(start)
+            end_str = fmt_short_date(end_date)
             line = f"{c['peptide_name']} — Day {day_num} of {target} (range {dur}, started {start_str}, end ~{end_str})"
             if c["duration_max"] and day_num > c["duration_max"]:
                 line += "  ⚠ past max duration"
@@ -2260,7 +2265,7 @@ def handle_course(_: argparse.Namespace) -> int:
             if c["last_completed"] and c["gap_days"]:
                 last = datetime.date.fromisoformat(c["last_completed"])
                 next_due = last + datetime.timedelta(days=c["gap_days"])
-                line += f". Last course ended {last.strftime('%b %-d')}. Next due ~{next_due.strftime('%b %-d')}."
+                line += f". Last course ended {fmt_short_date(last)}. Next due ~{fmt_short_date(next_due)}."
         print(line)
     conn.close()
     return 0
